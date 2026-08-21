@@ -24,6 +24,7 @@ void WasapiCapture::Stop() {
             m_captureThread.join();
         }
     }
+    m_audioCallback = nullptr;
 }
 
 void WasapiCapture::CaptureThreadProc() {

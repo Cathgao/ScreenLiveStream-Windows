@@ -45,6 +45,7 @@ bool TcpStreamer::Start(const std::string& targetIp, uint16_t targetPort) {
 
 void TcpStreamer::Stop() {
     if (m_isConnected.exchange(false)) {
+        std::lock_guard<std::mutex> lock(m_sendMutex);
         if (m_sock != INVALID_SOCKET) {
             uint8_t stopHeader[20] = {};
             stopHeader[0] = 0x51; // 'Q'
@@ -71,6 +72,8 @@ void TcpStreamer::SendFrame(
     if (!m_isConnected || m_sock == INVALID_SOCKET || !data || size == 0) return;
 
     std::lock_guard<std::mutex> lock(m_sendMutex);
+    if (!m_isConnected || m_sock == INVALID_SOCKET) return;
+
     uint32_t currentSeq = isAudio ? (++m_audioSeq) : (++m_videoSeq);
 
     uint8_t flags = 0;

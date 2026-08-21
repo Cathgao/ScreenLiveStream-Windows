@@ -14,12 +14,14 @@ WmfAudioEncoder::~WmfAudioEncoder() {
 }
 
 void WmfAudioEncoder::Shutdown() {
+    m_isInitialized = false;
+    std::lock_guard<std::mutex> lock(m_audioMutex);
     if (m_encoder) {
         m_encoder->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         m_encoder->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
         m_encoder = nullptr;
     }
-    m_isInitialized = false;
+    m_encodedCallback = nullptr;
 }
 
 bool WmfAudioEncoder::Initialize(int sampleRate, int channels, int bitrateBps) {
@@ -109,6 +111,9 @@ bool WmfAudioEncoder::Initialize(int sampleRate, int channels, int bitrateBps) {
 }
 
 bool WmfAudioEncoder::EncodePcm(const uint8_t* pcm16Data, size_t bytes, int64_t timestampNs) {
+    if (!m_isInitialized || !pcm16Data || bytes == 0) return false;
+
+    std::lock_guard<std::mutex> lock(m_audioMutex);
     if (!m_isInitialized || !m_encoder || !pcm16Data || bytes == 0) return false;
 
     Microsoft::WRL::ComPtr<IMFMediaBuffer> mediaBuffer;

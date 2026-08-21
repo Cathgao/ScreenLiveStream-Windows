@@ -67,11 +67,14 @@ bool UdpStreamer::Start(const std::string& targetIp, uint16_t targetPort) {
 
 void UdpStreamer::Stop() {
     if (m_isRunning.exchange(false)) {
-        if (m_sock != INVALID_SOCKET) {
-            auto stopPacket = Protocol::BuildStreamStopPacket();
-            sendto(m_sock, (const char*)stopPacket.data(), (int)stopPacket.size(), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
-            closesocket(m_sock);
-            m_sock = INVALID_SOCKET;
+        {
+            std::lock_guard<std::mutex> lock(m_sendMutex);
+            if (m_sock != INVALID_SOCKET) {
+                auto stopPacket = Protocol::BuildStreamStopPacket();
+                sendto(m_sock, (const char*)stopPacket.data(), (int)stopPacket.size(), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
+                closesocket(m_sock);
+                m_sock = INVALID_SOCKET;
+            }
         }
         if (m_recvThread.joinable()) {
             m_recvThread.join();
@@ -91,6 +94,8 @@ void UdpStreamer::SendFrame(
     if (!m_isRunning || m_sock == INVALID_SOCKET || !data || size == 0) return;
 
     std::lock_guard<std::mutex> lock(m_sendMutex);
+    if (!m_isRunning || m_sock == INVALID_SOCKET) return;
+
     uint32_t currentSeq = isAudio ? (++m_audioSeq) : (++m_videoSeq);
 
     if (isAudio) {

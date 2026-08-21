@@ -6,6 +6,8 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include <atomic>
+#include <mutex>
 
 class WmfAudioEncoder {
 public:
@@ -27,8 +29,9 @@ private:
     int m_sampleRate = 48000;
     int m_channels = 2;
     int m_bitrateBps = 128000;
-    bool m_isInitialized = false;
+    std::atomic<bool> m_isInitialized{ false };
     AudioEncodedCallback m_encodedCallback;
+    std::mutex m_audioMutex;
 
     void DrainOutput(int64_t timestampMs);
 };
