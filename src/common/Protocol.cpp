@@ -61,44 +61,6 @@ int64_t GetCurrentMillis() {
     ).count();
 }
 
-std::vector<uint8_t> BuildPacket(
-    const uint8_t* payload,
-    size_t payloadSize,
-    uint32_t frameSeq,
-    uint64_t timestampMs,
-    uint16_t packetIndex,
-    uint16_t totalPackets,
-    bool isKeyframe,
-    bool isCodecConfig,
-    bool isHevc,
-    bool isAudio
-) {
-    size_t totalLen = HEADER_SIZE + payloadSize;
-    std::vector<uint8_t> packet(totalLen);
-
-    packet[0] = MAGIC_0;
-    packet[1] = MAGIC_1;
-    packet[2] = VERSION;
-
-    uint8_t flags = 0;
-    if (isKeyframe) flags |= FLAG_KEYFRAME;
-    if (isCodecConfig) flags |= FLAG_CODEC_CONFIG;
-    if (isHevc) flags |= FLAG_CODEC_HEVC;
-    if (isAudio) flags |= FLAG_AUDIO;
-    packet[3] = flags;
-
-    WriteBigEndian32(&packet[4], frameSeq);
-    WriteBigEndian64(&packet[8], timestampMs);
-    WriteBigEndian16(&packet[16], packetIndex);
-    WriteBigEndian16(&packet[18], totalPackets);
-    WriteBigEndian16(&packet[20], static_cast<uint16_t>(payloadSize));
-
-    if (payload && payloadSize > 0) {
-        std::memcpy(&packet[HEADER_SIZE], payload, payloadSize);
-    }
-    return packet;
-}
-
 std::vector<uint8_t> BuildStreamStopPacket() {
     std::vector<uint8_t> packet(HEADER_SIZE, 0);
     packet[0] = MAGIC_0;

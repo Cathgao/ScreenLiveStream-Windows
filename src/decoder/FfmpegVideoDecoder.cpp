@@ -224,9 +224,6 @@ bool FfmpegVideoDecoder::DecodeNalu(const uint8_t* data, size_t size, int64_t ti
 void FfmpegVideoDecoder::ProcessDecodedFrame(AVFrame* frame, int64_t timestampMs) {
     if (!frame || frame->width <= 0 || frame->height <= 0) return;
 
-    m_videoWidth = frame->width;
-    m_videoHeight = frame->height;
-
     // 1. Direct D3D11VA Hardware Accelerated Frame
     if (frame->format == AV_PIX_FMT_D3D11) {
         ID3D11Texture2D* hwTexture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);

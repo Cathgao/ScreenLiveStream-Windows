@@ -11,11 +11,9 @@ extern "C" {
 #include <libavutil/avutil.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
-#include <libavutil/imgutils.h>
-#include <libswscale/swscale.h>
 }
 
-#include "WmfVideoDecoder.h" // For VideoCodecType enum
+#include "../encoder/WmfVideoEncoder.h" // For VideoCodecType enum
 
 class FfmpegVideoDecoder {
 public:
@@ -46,9 +44,6 @@ private:
     VideoCodecType m_codecType = VideoCodecType::H265_HEVC;
     bool m_isInitialized = false;
     bool m_isHwAccelActive = false;
-
-    int m_videoWidth = 0;
-    int m_videoHeight = 0;
 
     // GPU-side D3D11 render texture for D3D11VA hardware frame copying
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_renderNv12Texture;

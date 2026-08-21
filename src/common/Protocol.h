@@ -57,19 +57,6 @@ struct ParsedPacket {
 };
 
 // Packet builders and parsers
-std::vector<uint8_t> BuildPacket(
-    const uint8_t* payload,
-    size_t payloadSize,
-    uint32_t frameSeq,
-    uint64_t timestampMs,
-    uint16_t packetIndex,
-    uint16_t totalPackets,
-    bool isKeyframe,
-    bool isCodecConfig,
-    bool isHevc,
-    bool isAudio = false
-);
-
 std::vector<uint8_t> BuildStreamStopPacket();
 bool IsStreamStopPacket(const uint8_t* data, size_t length);
 std::vector<uint8_t> BuildPingPacket(uint32_t probeSeq, int64_t sendTimeNanos);

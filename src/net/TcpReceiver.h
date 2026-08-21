@@ -40,21 +40,6 @@ private:
     VideoFrameCallback m_videoCallback;
     AudioFrameCallback m_audioCallback;
 
-    struct FrameAssembly {
-        uint32_t frameSeq = 0;
-        uint64_t timestampMs = 0;
-        uint16_t totalPackets = 0;
-        uint16_t receivedPackets = 0;
-        bool isKeyframe = false;
-        bool isCodecConfig = false;
-        bool isHevc = false;
-        bool isAudio = false;
-        std::vector<std::vector<uint8_t>> chunks;
-    };
-
-    std::unordered_map<uint32_t, FrameAssembly> m_assemblies;
-
     void ListenThreadProc();
     void HandleClient(SOCKET clientSock);
-    void ProcessParsedPacket(const Protocol::ParsedPacket& pkt);
 };
