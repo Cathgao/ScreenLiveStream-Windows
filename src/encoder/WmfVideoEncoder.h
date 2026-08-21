@@ -9,6 +9,7 @@
 #include <codecapi.h>
 #include <wrl/client.h>
 #include <vector>
+#include <set>
 #include <unordered_map>
 #include <functional>
 #include <cstdint>
@@ -22,6 +23,21 @@ enum class VideoCodecType {
     H265_HEVC
 };
 
+enum class RateControlMode : uint32_t {
+    CBR = 0,                // eAVEncCommonRateControlMode_CBR (恒定码率)
+    PeakConstrainedVBR = 1, // eAVEncCommonRateControlMode_PeakConstrainedVBR (受限 VBR)
+    UnconstrainedVBR = 2,   // eAVEncCommonRateControlMode_UnconstrainedVBR (动态码率 VBR)
+    Quality = 3,            // eAVEncCommonRateControlMode_Quality (恒定质量 CQF)
+    LowDelayVBR = 4,        // eAVEncCommonRateControlMode_LowDelayVBR (低延迟 VBR)
+    GlobalVBR = 5,          // eAVEncCommonRateControlMode_GlobalVBR (全局 VBR)
+    GlobalLowDelayVBR = 6   // eAVEncCommonRateControlMode_GlobalLowDelayVBR (全局低延迟 VBR)
+};
+
+struct RateControlModeInfo {
+    RateControlMode mode;
+    std::wstring displayName;
+};
+
 class WmfVideoEncoder {
 public:
     using EncodedCallback = std::function<void(
@@ -33,6 +49,11 @@ public:
         bool isHevc
     )>;
 
+    static std::vector<RateControlModeInfo> QuerySupportedRateControlModes(
+        IMFDXGIDeviceManager* dxgiManager,
+        VideoCodecType codecType
+    );
+
     WmfVideoEncoder(ID3D11Device* d3d11Device, IMFDXGIDeviceManager* dxgiManager);
     ~WmfVideoEncoder();
 
@@ -41,7 +62,8 @@ public:
         int height,
         int fps,
         int bitrateKbps,
-        VideoCodecType codecType = VideoCodecType::H265_HEVC
+        VideoCodecType codecType = VideoCodecType::H265_HEVC,
+        RateControlMode rateControlMode = RateControlMode::UnconstrainedVBR
     );
 
     void Shutdown();
@@ -53,6 +75,7 @@ public:
 
     bool IsInitialized() const { return m_isInitialized; }
     VideoCodecType GetCodecType() const { return m_codecType; }
+    RateControlMode GetRateControlMode() const { return m_rateControlMode; }
 
 private:
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
@@ -77,6 +100,7 @@ private:
     int m_fps = 60;
     int m_bitrateKbps = 16000;
     VideoCodecType m_codecType = VideoCodecType::H265_HEVC;
+    RateControlMode m_rateControlMode = RateControlMode::UnconstrainedVBR;
     std::atomic<bool> m_isInitialized{ false };
     bool m_forceKeyframe = true;
     uint32_t m_frameIndex = 0;

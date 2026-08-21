@@ -2,7 +2,6 @@
 #include <string>
 #include <iostream>
 #include <sstream>
-#include <fstream>
 #include <mutex>
 #include <chrono>
 #include <iomanip>
@@ -39,7 +38,8 @@ public:
         ss << "[" << std::put_time(&tm_now, "%H:%M:%S") << "." << std::setfill('0') << std::setw(3) << ms.count()
            << "][" << levelStr << "][" << tag << "] " << msg << "\n";
 
-        OutputDebugStringA(ss.str().c_str());
+        std::string str = ss.str();
+        OutputDebugStringA(str.c_str());
     }
 
     static void D(const std::string& tag, const std::string& msg) { Log(LogLevel::Debug, tag, msg); }

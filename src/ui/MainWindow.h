@@ -112,6 +112,7 @@ private:
     HWND m_editIp = nullptr;
     HWND m_editPort = nullptr;
     HWND m_comboCodec = nullptr;
+    HWND m_comboRateControl = nullptr;
     HWND m_comboBitrate = nullptr;
     HWND m_comboFps = nullptr;
     HWND m_comboProtocol = nullptr;
@@ -125,6 +126,7 @@ private:
     HWND m_lblIp = nullptr;
     HWND m_lblPort = nullptr;
     HWND m_lblCodec = nullptr;
+    HWND m_lblRateControl = nullptr;
     HWND m_lblBitrate = nullptr;
     HWND m_lblFps = nullptr;
     HWND m_lblProtocol = nullptr;
@@ -141,6 +143,7 @@ private:
     void RefreshCaptureTargets();
     void RefreshDiscoveredDevices();
     void RefreshSupportedFps();
+    void RefreshSupportedRateControlModes();
     void UpdateUiMode();
     void UpdateStatusText();
 

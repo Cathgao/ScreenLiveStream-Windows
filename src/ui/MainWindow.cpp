@@ -28,6 +28,7 @@
 #define ID_CHK_AUDIO 2013
 #define ID_BTN_ACTION 2014
 #define ID_BTN_REFRESH_DEVICES 2015
+#define ID_COMBO_RATE_CONTROL 2016
 
 #define WM_USER_DEVICES_UPDATED (WM_USER + 1)
 #define WM_USER_ADAPT_WINDOW (WM_USER + 2)
@@ -191,16 +192,24 @@ void MainWindow::InitControls() {
 
     m_btnRefreshDevices = CreateWindowExW(0, L"BUTTON", L"搜索", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 450, 131, 70, 28, m_hwnd, (HMENU)ID_BTN_REFRESH_DEVICES, m_hInstance, nullptr);
 
-    m_lblIp = CreateCardLabel(L"目标地址:", 34, 172, 75, 22);
-    m_editIp = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"192.168.1.100", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 112, 169, 260, 25, m_hwnd, (HMENU)ID_EDIT_IP, m_hInstance, nullptr);
-    m_lblPort = CreateCardLabel(L"端口:", 380, 172, 40, 22);
-    m_editPort = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"8888", WS_CHILD | WS_VISIBLE | ES_NUMBER, 420, 169, 100, 25, m_hwnd, (HMENU)ID_EDIT_PORT, m_hInstance, nullptr);
+    // Row 3: 目标地址 + 端口 + 协议
+    m_lblIp = CreateCardLabel(L"目标地址:", 34, 172, 65, 22);
+    m_editIp = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"192.168.1.100", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 102, 169, 145, 25, m_hwnd, (HMENU)ID_EDIT_IP, m_hInstance, nullptr);
+    m_lblPort = CreateCardLabel(L"端口:", 255, 172, 36, 22);
+    m_editPort = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"8888", WS_CHILD | WS_VISIBLE | ES_NUMBER, 294, 169, 58, 25, m_hwnd, (HMENU)ID_EDIT_PORT, m_hInstance, nullptr);
+    m_lblProtocol = CreateCardLabel(L"协议:", 360, 172, 36, 22);
+    m_comboProtocol = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 398, 169, 122, 140, m_hwnd, (HMENU)ID_COMBO_PROTOCOL, m_hInstance, nullptr);
+    SendMessage(m_comboProtocol, CB_ADDSTRING, 0, (LPARAM)L"UDP (低延迟)");
+    SendMessage(m_comboProtocol, CB_ADDSTRING, 0, (LPARAM)L"TCP (稳定)");
+    SendMessage(m_comboProtocol, CB_SETCURSEL, 0, 0);
     SendMessage(m_editIp, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
     SendMessage(m_editPort, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
+    SendMessage(m_comboProtocol, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
     SetWindowTheme(m_editIp, L"DarkMode_Explorer", nullptr);
     SetWindowTheme(m_editPort, L"DarkMode_Explorer", nullptr);
+    SetWindowTheme(m_comboProtocol, L"DarkMode_Explorer", nullptr);
 
-    // Card 2: 编码与网络参数
+    // Card 2: 编码与画质设置
     m_lblCodec = CreateCardLabel(L"视频编码:", 34, 254, 75, 22);
     m_comboCodec = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 112, 250, 140, 140, m_hwnd, (HMENU)ID_COMBO_CODEC, m_hInstance, nullptr);
     SendMessage(m_comboCodec, CB_ADDSTRING, 0, (LPARAM)L"H.265 / HEVC");
@@ -209,8 +218,18 @@ void MainWindow::InitControls() {
     SendMessage(m_comboCodec, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
     SetWindowTheme(m_comboCodec, L"DarkMode_Explorer", nullptr);
 
-    m_lblBitrate = CreateCardLabel(L"目标码率:", 274, 254, 75, 22);
-    m_comboBitrate = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 354, 250, 166, 160, m_hwnd, (HMENU)ID_COMBO_BITRATE, m_hInstance, nullptr);
+    m_lblRateControl = CreateCardLabel(L"编码模式:", 274, 254, 75, 22);
+    m_comboRateControl = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 354, 250, 166, 180, m_hwnd, (HMENU)ID_COMBO_RATE_CONTROL, m_hInstance, nullptr);
+    SendMessage(m_comboRateControl, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
+    SetWindowTheme(m_comboRateControl, L"DarkMode_Explorer", nullptr);
+
+    m_lblFps = CreateCardLabel(L"目标帧率:", 34, 288, 75, 22);
+    m_comboFps = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 112, 284, 140, 200, m_hwnd, (HMENU)ID_COMBO_FPS, m_hInstance, nullptr);
+    SendMessage(m_comboFps, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
+    SetWindowTheme(m_comboFps, L"DarkMode_Explorer", nullptr);
+
+    m_lblBitrate = CreateCardLabel(L"目标码率:", 274, 288, 75, 22);
+    m_comboBitrate = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 354, 284, 166, 160, m_hwnd, (HMENU)ID_COMBO_BITRATE, m_hInstance, nullptr);
     SendMessage(m_comboBitrate, CB_ADDSTRING, 0, (LPARAM)L"8 Mbps (流畅)");
     SendMessage(m_comboBitrate, CB_ADDSTRING, 0, (LPARAM)L"16 Mbps (高清)");
     SendMessage(m_comboBitrate, CB_ADDSTRING, 0, (LPARAM)L"25 Mbps (超清)");
@@ -218,19 +237,6 @@ void MainWindow::InitControls() {
     SendMessage(m_comboBitrate, CB_SETCURSEL, 1, 0);
     SendMessage(m_comboBitrate, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
     SetWindowTheme(m_comboBitrate, L"DarkMode_Explorer", nullptr);
-
-    m_lblFps = CreateCardLabel(L"目标帧率:", 34, 288, 75, 22);
-    m_comboFps = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 112, 284, 140, 200, m_hwnd, (HMENU)ID_COMBO_FPS, m_hInstance, nullptr);
-    SendMessage(m_comboFps, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
-    SetWindowTheme(m_comboFps, L"DarkMode_Explorer", nullptr);
-
-    m_lblProtocol = CreateCardLabel(L"传输协议:", 274, 288, 75, 22);
-    m_comboProtocol = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 354, 284, 166, 140, m_hwnd, (HMENU)ID_COMBO_PROTOCOL, m_hInstance, nullptr);
-    SendMessage(m_comboProtocol, CB_ADDSTRING, 0, (LPARAM)L"UDP (低延迟推荐)");
-    SendMessage(m_comboProtocol, CB_ADDSTRING, 0, (LPARAM)L"TCP (稳定投屏)");
-    SendMessage(m_comboProtocol, CB_SETCURSEL, 0, 0);
-    SendMessage(m_comboProtocol, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
-    SetWindowTheme(m_comboProtocol, L"DarkMode_Explorer", nullptr);
 
     // Toggles
     m_chkCursor = CreateWindowExW(0, L"BUTTON", L"捕获鼠标光标", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 34, 320, 210, 24, m_hwnd, (HMENU)ID_CHK_CURSOR, m_hInstance, nullptr);
@@ -242,6 +248,8 @@ void MainWindow::InitControls() {
 
     // Action Hero Button (Owner-draw)
     m_btnAction = CreateWindowExW(0, L"BUTTON", L"启动画面投屏", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 20, 504, 504, 46, m_hwnd, (HMENU)ID_BTN_ACTION, m_hInstance, nullptr);
+
+    RefreshSupportedRateControlModes();
 }
 
 void MainWindow::RefreshCaptureTargets() {
@@ -350,6 +358,38 @@ void MainWindow::RefreshSupportedFps() {
     SendMessage(m_comboFps, CB_SETCURSEL, defaultSel, 0);
 }
 
+void MainWindow::RefreshSupportedRateControlModes() {
+    if (!m_comboRateControl) return;
+
+    int codecIdx = (int)SendMessage(m_comboCodec, CB_GETCURSEL, 0, 0);
+    VideoCodecType codecType = (codecIdx == 0) ? VideoCodecType::H265_HEVC : VideoCodecType::H264;
+
+    auto modes = WmfVideoEncoder::QuerySupportedRateControlModes(m_d3dResources.dxgiManager.Get(), codecType);
+
+    // 保留用户之前的选择（若在当前编码中依然支持，默认推荐 VBR）
+    RateControlMode prevMode = RateControlMode::UnconstrainedVBR;
+    int curSel = (int)SendMessage(m_comboRateControl, CB_GETCURSEL, 0, 0);
+    if (curSel != CB_ERR) {
+        LRESULT curData = SendMessage(m_comboRateControl, CB_GETITEMDATA, curSel, 0);
+        if (curData != CB_ERR) {
+            prevMode = static_cast<RateControlMode>(curData);
+        }
+    }
+
+    SendMessage(m_comboRateControl, CB_RESETCONTENT, 0, 0);
+
+    int defaultSel = 0;
+    for (size_t i = 0; i < modes.size(); ++i) {
+        LRESULT itemIdx = SendMessage(m_comboRateControl, CB_ADDSTRING, 0, (LPARAM)modes[i].displayName.c_str());
+        SendMessage(m_comboRateControl, CB_SETITEMDATA, itemIdx, (LPARAM)static_cast<uint32_t>(modes[i].mode));
+        if (modes[i].mode == prevMode) {
+            defaultSel = (int)itemIdx;
+        }
+    }
+
+    SendMessage(m_comboRateControl, CB_SETCURSEL, defaultSel, 0);
+}
+
 void MainWindow::RefreshDiscoveredDevices() {
     std::vector<DiscoveredDevice> devicesCopy;
     {
@@ -400,8 +440,14 @@ void MainWindow::UpdateUiMode() {
         ShowWindow(m_btnRefreshDevices, SW_SHOW);
         ShowWindow(m_lblIp, SW_SHOW);
         ShowWindow(m_editIp, SW_SHOW);
+        ShowWindow(m_lblPort, SW_SHOW);
+        ShowWindow(m_editPort, SW_SHOW);
+        ShowWindow(m_lblProtocol, SW_SHOW);
+        ShowWindow(m_comboProtocol, SW_SHOW);
         ShowWindow(m_lblCodec, SW_SHOW);
         ShowWindow(m_comboCodec, SW_SHOW);
+        ShowWindow(m_lblRateControl, SW_SHOW);
+        ShowWindow(m_comboRateControl, SW_SHOW);
         ShowWindow(m_lblBitrate, SW_SHOW);
         ShowWindow(m_comboBitrate, SW_SHOW);
         ShowWindow(m_lblFps, SW_SHOW);
@@ -411,11 +457,28 @@ void MainWindow::UpdateUiMode() {
 
         // Position Sender controls
         SetWindowTextW(m_lblIp, L"目标地址:");
-        SetWindowPos(m_lblPort, nullptr, 380, 172, 40, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowPos(m_lblIp, nullptr, 34, 172, 65, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowPos(m_editIp, nullptr, 102, 169, 145, 25, SWP_NOZORDER | SWP_SHOWWINDOW);
         SetWindowTextW(m_lblPort, L"端口:");
-        SetWindowPos(m_editPort, nullptr, 420, 169, 100, 25, SWP_NOZORDER | SWP_SHOWWINDOW);
-        SetWindowPos(m_lblProtocol, nullptr, 274, 288, 75, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
-        SetWindowPos(m_comboProtocol, nullptr, 354, 284, 166, 140, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowPos(m_lblPort, nullptr, 255, 172, 36, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowPos(m_editPort, nullptr, 294, 169, 58, 25, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowTextW(m_lblProtocol, L"协议:");
+        SetWindowPos(m_lblProtocol, nullptr, 360, 172, 36, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowPos(m_comboProtocol, nullptr, 398, 169, 122, 140, SWP_NOZORDER | SWP_SHOWWINDOW);
+
+        SetWindowPos(m_lblCodec, nullptr, 34, 254, 75, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowPos(m_comboCodec, nullptr, 112, 250, 140, 140, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowPos(m_lblRateControl, nullptr, 274, 254, 75, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowPos(m_comboRateControl, nullptr, 354, 250, 166, 180, SWP_NOZORDER | SWP_SHOWWINDOW);
+
+        SetWindowPos(m_lblFps, nullptr, 34, 288, 75, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowPos(m_comboFps, nullptr, 112, 284, 140, 200, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowPos(m_lblBitrate, nullptr, 274, 288, 75, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowPos(m_comboBitrate, nullptr, 354, 284, 166, 160, SWP_NOZORDER | SWP_SHOWWINDOW);
+
+        SetWindowPos(m_chkCursor, nullptr, 34, 320, 210, 24, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowPos(m_chkAudio, nullptr, 274, 320, 246, 24, SWP_NOZORDER | SWP_SHOWWINDOW);
+
         SetWindowPos(m_btnAction, nullptr, 20, 504, 504, 46, SWP_NOZORDER | SWP_SHOWWINDOW);
 
         EnableWindow(m_comboTarget, !m_isStreaming);
@@ -425,6 +488,7 @@ void MainWindow::UpdateUiMode() {
         EnableWindow(m_editIp, !m_isStreaming);
         EnableWindow(m_editPort, !m_isStreaming);
         EnableWindow(m_comboCodec, !m_isStreaming);
+        EnableWindow(m_comboRateControl, !m_isStreaming);
         EnableWindow(m_comboBitrate, !m_isStreaming);
         EnableWindow(m_comboFps, !m_isStreaming);
         EnableWindow(m_comboProtocol, !m_isStreaming);
@@ -445,6 +509,8 @@ void MainWindow::UpdateUiMode() {
         ShowWindow(m_editIp, SW_HIDE);
         ShowWindow(m_lblCodec, SW_HIDE);
         ShowWindow(m_comboCodec, SW_HIDE);
+        ShowWindow(m_lblRateControl, SW_HIDE);
+        ShowWindow(m_comboRateControl, SW_HIDE);
         ShowWindow(m_lblBitrate, SW_HIDE);
         ShowWindow(m_comboBitrate, SW_HIDE);
         ShowWindow(m_lblFps, SW_HIDE);
@@ -457,6 +523,7 @@ void MainWindow::UpdateUiMode() {
         SetWindowTextW(m_lblPort, L"监听端口:");
         SetWindowPos(m_editPort, nullptr, 112, 96, 140, 25, SWP_NOZORDER | SWP_SHOWWINDOW);
         SetWindowPos(m_lblProtocol, nullptr, 274, 100, 75, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
+        SetWindowTextW(m_lblProtocol, L"传输协议:");
         SetWindowPos(m_comboProtocol, nullptr, 354, 96, 166, 140, SWP_NOZORDER | SWP_SHOWWINDOW);
         SetWindowPos(m_btnAction, nullptr, 20, 412, 504, 46, SWP_NOZORDER | SWP_SHOWWINDOW);
 
@@ -518,13 +585,23 @@ bool MainWindow::StartSender() {
         }
     }
 
+    int rcIdx = (int)SendMessage(m_comboRateControl, CB_GETCURSEL, 0, 0);
+    RateControlMode rateControlMode = RateControlMode::UnconstrainedVBR;
+    if (rcIdx != CB_ERR) {
+        LRESULT data = SendMessage(m_comboRateControl, CB_GETITEMDATA, rcIdx, 0);
+        if (data != CB_ERR) {
+            rateControlMode = static_cast<RateControlMode>(data);
+        }
+    }
+
     int protoIdx = (int)SendMessage(m_comboProtocol, CB_GETCURSEL, 0, 0);
     bool isUdp = (protoIdx == 0);
 
     bool captureCursor = (SendMessage(m_chkCursor, BM_GETCHECK, 0, 0) == BST_CHECKED);
     bool captureAudio = (SendMessage(m_chkAudio, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
-    Logger::I("MainWindow", "Starting Sender Pipeline -> " + std::string(ipStr) + ":" + std::to_string(port));
+    Logger::I("MainWindow", "Starting Sender Pipeline -> " + std::string(ipStr) + ":" + std::to_string(port) +
+              ", RateControlMode=" + std::to_string(static_cast<uint32_t>(rateControlMode)));
 
     // 1. Init Network Streamer
     if (isUdp) {
@@ -576,7 +653,7 @@ bool MainWindow::StartSender() {
     m_statRttMs = 0;
 
     m_videoEncoder = std::make_unique<WmfVideoEncoder>(m_d3dResources.device.Get(), m_d3dResources.dxgiManager.Get());
-    if (!m_videoEncoder->Initialize(initW, initH, fps, bitrateKbps, codecType)) {
+    if (!m_videoEncoder->Initialize(initW, initH, fps, bitrateKbps, codecType, rateControlMode)) {
         MessageBoxW(m_hwnd, L"硬件视频编码器初始化失败！", L"错误", MB_OK | MB_ICONERROR);
         StopSender();
         return false;
@@ -997,13 +1074,13 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     g.DrawPath(&cardBorderPen, &card1Path);
                     g.DrawString(L"采集与目标设备", -1, &headerFont, Gdiplus::PointF(34.0f, 74.0f), &textWhite);
 
-                    // 4. Card 2: 编码与网络设置 (X: 20, Y: 220, W: 504, H: 136)
+                    // 4. Card 2: 编码与画质设置 (X: 20, Y: 220, W: 504, H: 136)
                     Gdiplus::GraphicsPath card2Path;
                     Gdiplus::RectF card2Rc(20.0f, 220.0f, 504.0f, 136.0f);
                     AddRoundedRectToPath(card2Path, card2Rc, 8.0f);
                     g.FillPath(&cardBg, &card2Path);
                     g.DrawPath(&cardBorderPen, &card2Path);
-                    g.DrawString(L"编码与网络设置", -1, &headerFont, Gdiplus::PointF(34.0f, 228.0f), &textWhite);
+                    g.DrawString(L"编码与画质设置", -1, &headerFont, Gdiplus::PointF(34.0f, 228.0f), &textWhite);
 
                     // 5. Card 3: 实时运行状态 (X: 20, Y: 364, W: 504, H: 122)
                     Gdiplus::GraphicsPath card3Path;
@@ -1286,6 +1363,8 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 pThis->RefreshCaptureTargets();
             } else if (id == ID_COMBO_TARGET && code == CBN_SELCHANGE) {
                 pThis->RefreshSupportedFps();
+            } else if (id == ID_COMBO_CODEC && code == CBN_SELCHANGE) {
+                pThis->RefreshSupportedRateControlModes();
             } else if (id == ID_BTN_REFRESH_DEVICES && code == BN_CLICKED) {
                 if (pThis->m_lanDiscovery) {
                     pThis->m_lanDiscovery->Rescan();

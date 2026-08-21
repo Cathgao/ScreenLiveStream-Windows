@@ -164,6 +164,129 @@ bool WmfVideoEncoder::ConvertBgraToNv12(ID3D11Texture2D* bgraTexture, ID3D11Text
     return true;
 }
 
+std::vector<RateControlModeInfo> WmfVideoEncoder::QuerySupportedRateControlModes(
+    IMFDXGIDeviceManager* dxgiManager,
+    VideoCodecType codecType
+) {
+    UNREFERENCED_PARAMETER(dxgiManager);
+    std::vector<RateControlModeInfo> result;
+    std::set<uint32_t> foundModes;
+
+    GUID targetSubtype = (codecType == VideoCodecType::H265_HEVC) ? MFVideoFormat_HEVC : MFVideoFormat_H264;
+    MFT_REGISTER_TYPE_INFO outputTypeInfo = { MFMediaType_Video, targetSubtype };
+    IMFActivate** ppActivate = nullptr;
+    UINT32 count = 0;
+
+    HRESULT hr = MFTEnumEx(
+        MFT_CATEGORY_VIDEO_ENCODER,
+        MFT_ENUM_FLAG_ALL | MFT_ENUM_FLAG_SORTANDFILTER,
+        nullptr,
+        &outputTypeInfo,
+        &ppActivate,
+        &count
+    );
+
+    if (SUCCEEDED(hr) && count > 0 && ppActivate) {
+        for (UINT32 i = 0; i < count; ++i) {
+            try {
+                Microsoft::WRL::ComPtr<IMFTransform> encoder;
+                if (SUCCEEDED(ppActivate[i]->ActivateObject(IID_PPV_ARGS(&encoder))) && encoder) {
+                    Microsoft::WRL::ComPtr<ICodecAPI> codecApi;
+                    if (SUCCEEDED(encoder->QueryInterface(IID_PPV_ARGS(&codecApi))) && codecApi) {
+                        if (codecApi->IsSupported(&CODECAPI_AVEncCommonRateControlMode) == S_OK) {
+                            // 1. Try GetParameterValues
+                            VARIANT* pValues = nullptr;
+                            ULONG numValues = 0;
+                            if (SUCCEEDED(codecApi->GetParameterValues(&CODECAPI_AVEncCommonRateControlMode, &pValues, &numValues)) && pValues && numValues > 0) {
+                                for (ULONG v = 0; v < numValues; ++v) {
+                                    uint32_t val = (pValues[v].vt == VT_UI4) ? pValues[v].ulVal : (uint32_t)pValues[v].lVal;
+                                    foundModes.insert(val);
+                                    VariantClear(&pValues[v]);
+                                }
+                                CoTaskMemFree(pValues);
+                            }
+
+                            // 2. Try GetParameterRange
+                            VARIANT vMin, vMax, vDelta;
+                            VariantInit(&vMin); VariantInit(&vMax); VariantInit(&vDelta);
+                            if (SUCCEEDED(codecApi->GetParameterRange(&CODECAPI_AVEncCommonRateControlMode, &vMin, &vMax, &vDelta))) {
+                                ULONG minVal = (vMin.vt == VT_UI4) ? vMin.ulVal : (ULONG)vMin.lVal;
+                                ULONG maxVal = (vMax.vt == VT_UI4) ? vMax.ulVal : (ULONG)vMax.lVal;
+                                ULONG step = (vDelta.vt == VT_UI4) ? vDelta.ulVal : (ULONG)vDelta.lVal;
+                                if (step == 0) step = 1;
+                                for (ULONG val = minVal; val <= maxVal && val <= 6; val += step) {
+                                    foundModes.insert(val);
+                                }
+                                VariantClear(&vMin); VariantClear(&vMax); VariantClear(&vDelta);
+                            }
+                        }
+                    }
+                    encoder = nullptr;
+                }
+            } catch (...) {}
+            ppActivate[i]->Release();
+        }
+        CoTaskMemFree(ppActivate);
+    }
+
+    // Baseline streaming modes: ensure CBR, LowDelayVBR, UnconstrainedVBR, Quality CQF are always supported
+    foundModes.insert(static_cast<uint32_t>(RateControlMode::CBR));
+    foundModes.insert(static_cast<uint32_t>(RateControlMode::LowDelayVBR));
+    foundModes.insert(static_cast<uint32_t>(RateControlMode::UnconstrainedVBR));
+    foundModes.insert(static_cast<uint32_t>(RateControlMode::Quality));
+
+    auto GetModeName = [](RateControlMode mode) -> std::wstring {
+        switch (mode) {
+            case RateControlMode::UnconstrainedVBR: return L"VBR (动态码率 - 推荐)";
+            case RateControlMode::CBR: return L"CBR (恒定码率)";
+            case RateControlMode::LowDelayVBR: return L"低延迟 VBR (Low-Delay)";
+            case RateControlMode::PeakConstrainedVBR: return L"受限 VBR (Peak Constrained)";
+            case RateControlMode::Quality: return L"恒定质量 CQF (Quality)";
+            case RateControlMode::GlobalLowDelayVBR: return L"全局低延迟 VBR";
+            case RateControlMode::GlobalVBR: return L"全局 VBR";
+            default: return L"自定义模式";
+        }
+    };
+
+    static const RateControlMode priorityOrder[] = {
+        RateControlMode::UnconstrainedVBR,
+        RateControlMode::CBR,
+        RateControlMode::LowDelayVBR,
+        RateControlMode::PeakConstrainedVBR,
+        RateControlMode::Quality,
+        RateControlMode::GlobalLowDelayVBR,
+        RateControlMode::GlobalVBR
+    };
+
+    if (!foundModes.empty()) {
+        for (auto m : priorityOrder) {
+            if (foundModes.count(static_cast<uint32_t>(m))) {
+                result.push_back({ m, GetModeName(m) });
+            }
+        }
+    }
+
+    if (result.empty()) {
+        result.push_back({ RateControlMode::UnconstrainedVBR, GetModeName(RateControlMode::UnconstrainedVBR) });
+        result.push_back({ RateControlMode::CBR, GetModeName(RateControlMode::CBR) });
+        result.push_back({ RateControlMode::LowDelayVBR, GetModeName(RateControlMode::LowDelayVBR) });
+        result.push_back({ RateControlMode::Quality, GetModeName(RateControlMode::Quality) });
+    }
+
+    std::string modeNames;
+    for (size_t k = 0; k < result.size(); ++k) {
+        char szBuf[128] = {};
+        WideCharToMultiByte(CP_UTF8, 0, result[k].displayName.c_str(), -1, szBuf, sizeof(szBuf), nullptr, nullptr);
+        if (k > 0) modeNames += ", ";
+        modeNames += szBuf;
+    }
+
+    Logger::I("WmfVideoEncoder", "Hardware rate control modes scanned for " +
+              std::string(codecType == VideoCodecType::H265_HEVC ? "HEVC" : "H.264") +
+              ": [" + modeNames + "]");
+    return result;
+}
+
 static bool TrySetupEncoder(
     IMFTransform* encoder,
     IMFDXGIDeviceManager* dxgiManager,
@@ -173,6 +296,7 @@ static bool TrySetupEncoder(
     int height,
     int fps,
     int bitrateKbps,
+    RateControlMode rateControlMode,
     Microsoft::WRL::ComPtr<ICodecAPI>& outCodecApi
 ) {
     if (!encoder) return false;
@@ -286,8 +410,19 @@ static bool TrySetupEncoder(
         VariantInit(&val);
 
         val.vt = VT_UI4;
-        val.ulVal = eAVEncCommonRateControlMode_CBR;
-        outCodecApi->SetValue(&CODECAPI_AVEncCommonRateControlMode, &val);
+        val.ulVal = static_cast<ULONG>(rateControlMode);
+        HRESULT hrMode = outCodecApi->SetValue(&CODECAPI_AVEncCommonRateControlMode, &val);
+        if (FAILED(hrMode)) {
+            Logger::W("WmfVideoEncoder", "Failed to set RateControlMode = " + std::to_string((uint32_t)rateControlMode) + ", fallback to CBR");
+            val.ulVal = eAVEncCommonRateControlMode_CBR;
+            outCodecApi->SetValue(&CODECAPI_AVEncCommonRateControlMode, &val);
+        }
+
+        if (rateControlMode == RateControlMode::Quality) {
+            val.vt = VT_UI4;
+            val.ulVal = 75; // Quality factor (1..100)
+            outCodecApi->SetValue(&CODECAPI_AVEncCommonQuality, &val);
+        }
 
         val.vt = VT_BOOL;
         val.boolVal = VARIANT_TRUE;
@@ -343,7 +478,8 @@ bool WmfVideoEncoder::Initialize(
     int height,
     int fps,
     int bitrateKbps,
-    VideoCodecType codecType
+    VideoCodecType codecType,
+    RateControlMode rateControlMode
 ) {
     Shutdown();
 
@@ -352,10 +488,12 @@ bool WmfVideoEncoder::Initialize(
     m_fps = fps > 0 ? fps : 60;
     m_bitrateKbps = bitrateKbps > 0 ? bitrateKbps : 16000;
     m_codecType = codecType;
+    m_rateControlMode = rateControlMode;
 
     Logger::I("WmfVideoEncoder", "Initializing encoder: " + std::to_string(m_width) + "x" + std::to_string(m_height) +
               " @" + std::to_string(m_fps) + "fps, " + std::to_string(m_bitrateKbps) + " Kbps, Requested=" +
-              (m_codecType == VideoCodecType::H265_HEVC ? "HEVC" : "H.264"));
+              (m_codecType == VideoCodecType::H265_HEVC ? "HEVC" : "H.264") +
+              ", RateControlMode=" + std::to_string((uint32_t)m_rateControlMode));
 
     if (!InitColorConverter()) {
         Logger::E("WmfVideoEncoder", "Failed to initialize D3D11 color converter.");
@@ -389,7 +527,7 @@ bool WmfVideoEncoder::Initialize(
             Microsoft::WRL::ComPtr<IMFTransform> encoder;
             hr = ppActivate[i]->ActivateObject(IID_PPV_ARGS(&encoder));
             if (SUCCEEDED(hr) && encoder) {
-                if (TrySetupEncoder(encoder.Get(), m_dxgiManager.Get(), m_nv12Textures[0].Get(), subtype, m_width, m_height, m_fps, m_bitrateKbps, m_codecApi)) {
+                if (TrySetupEncoder(encoder.Get(), m_dxgiManager.Get(), m_nv12Textures[0].Get(), subtype, m_width, m_height, m_fps, m_bitrateKbps, m_rateControlMode, m_codecApi)) {
                     m_encoder = encoder;
                     Logger::I("WmfVideoEncoder", "Successfully activated verified encoder: " + std::string(szName));
                     for (UINT32 j = 0; j < count; ++j) ppActivate[j]->Release();
