@@ -15,6 +15,8 @@ add_compile_definitions(
 if(MSVC)
     add_compile_options(/W4 /utf-8 /permissive- /Zc:__cplusplus /EHsc)
     add_compile_options(/await:strict /MP)
+    # 对第三方系统头文件（如 FFmpeg、Windows SDK）静音警告，保持业务代码严格 /W4
+    add_compile_options(/external:anglebrackets /external:W0)
 endif()
 
 # ======================== 激进性能与链接时优化 (LTO / LTCG) ========================
@@ -71,6 +73,9 @@ include_directories(
     src/render
     src/net
     src/ui
+)
+
+include_directories(SYSTEM
     ${FFMPEG_DIR}/include
 )
 
