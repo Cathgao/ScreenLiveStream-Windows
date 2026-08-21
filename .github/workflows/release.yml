@@ -68,10 +68,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG_NAME }}
-          name: "ScreenLiveStream Windows ${{ env.TAG_NAME }}"
           files: |
             ${{ env.ZIP_NAME }}
-            build/ScreenLiveStreamWindows.exe
           draft: false
           prerelease: false
           generate_release_notes: true

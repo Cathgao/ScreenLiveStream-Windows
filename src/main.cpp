@@ -14,8 +14,7 @@ int WINAPI wWinMain(
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
 
-    // Initialize File Logger
-    Logger::Init("questcast.log");
+    // Startup Log
     Logger::I("Main", "=== ScreenLiveStream Windows Starting ===");
 
     // Initialize WinRT and COM for the main UI thread

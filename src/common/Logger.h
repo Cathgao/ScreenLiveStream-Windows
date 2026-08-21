@@ -17,15 +17,6 @@ enum class LogLevel {
 
 class Logger {
 public:
-    static void Init(const std::string& logFileName = "questcast.log") {
-        std::lock_guard<std::mutex> lock(GetMutex());
-        GetLogFile().open(logFileName, std::ios::out | std::ios::trunc);
-        if (GetLogFile().is_open()) {
-            GetLogFile() << "=== QuestCast VR / ScreenLiveStream Windows Log Started ===\n";
-            GetLogFile().flush();
-        }
-    }
-
     static void Log(LogLevel level, const std::string& tag, const std::string& msg) {
         std::lock_guard<std::mutex> lock(GetMutex());
 
@@ -48,13 +39,7 @@ public:
         ss << "[" << std::put_time(&tm_now, "%H:%M:%S") << "." << std::setfill('0') << std::setw(3) << ms.count()
            << "][" << levelStr << "][" << tag << "] " << msg << "\n";
 
-        std::string line = ss.str();
-        OutputDebugStringA(line.c_str());
-
-        if (GetLogFile().is_open()) {
-            GetLogFile() << line;
-            GetLogFile().flush();
-        }
+        OutputDebugStringA(ss.str().c_str());
     }
 
     static void D(const std::string& tag, const std::string& msg) { Log(LogLevel::Debug, tag, msg); }
@@ -66,9 +51,5 @@ private:
     static std::mutex& GetMutex() {
         static std::mutex s_mutex;
         return s_mutex;
-    }
-    static std::ofstream& GetLogFile() {
-        static std::ofstream s_file;
-        return s_file;
     }
 };
