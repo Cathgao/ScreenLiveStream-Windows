@@ -1,0 +1,59 @@
+# Build output directories
+build/
+bin/
+out/
+x64/
+x86/
+Debug/
+Release/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Visual Studio / MSVC artifacts
+.vs/
+*.sln.docstates
+*.suo
+*.user
+*.userosscache
+*.sln
+*.vcxproj*
+*.vcxproj.user
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+*.ipch
+
+# Compiled Object files & binaries from root/src
+*.obj
+*.o
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.tlog
+
+# Logs & temp files
+questcast.log
+*.log
+*.tmp
+*.temp
+
+# IDEs & local configs
+.vscode/
+.idea/
+.agents/
+.gemini/
+
+# Third-party prebuilt binaries (auto-fetched on demand by CMake)
+third_party/
