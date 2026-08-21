@@ -76,11 +76,7 @@ MainWindow::~MainWindow() {
 }
 
 void MainWindow::InitThemeResources() {
-    m_hFontTitle = CreateFontW(-18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-    m_hFontHeader = CreateFontW(-14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
     m_hFontNormal = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-    m_hFontBold = CreateFontW(-15, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-    m_hFontSmall = CreateFontW(-11, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
 
     m_hBrushBg = CreateSolidBrush(RGB(18, 18, 20));       // #121214
     m_hBrushCard = CreateSolidBrush(RGB(30, 30, 36));     // #1E1E24
@@ -88,11 +84,7 @@ void MainWindow::InitThemeResources() {
 }
 
 void MainWindow::CleanupThemeResources() {
-    if (m_hFontTitle) { DeleteObject(m_hFontTitle); m_hFontTitle = nullptr; }
-    if (m_hFontHeader) { DeleteObject(m_hFontHeader); m_hFontHeader = nullptr; }
     if (m_hFontNormal) { DeleteObject(m_hFontNormal); m_hFontNormal = nullptr; }
-    if (m_hFontBold) { DeleteObject(m_hFontBold); m_hFontBold = nullptr; }
-    if (m_hFontSmall) { DeleteObject(m_hFontSmall); m_hFontSmall = nullptr; }
 
     if (m_hBrushBg) { DeleteObject(m_hBrushBg); m_hBrushBg = nullptr; }
     if (m_hBrushCard) { DeleteObject(m_hBrushCard); m_hBrushCard = nullptr; }
@@ -133,7 +125,7 @@ bool MainWindow::Create(HINSTANCE hInstance, int nCmdShow) {
     m_hwnd = CreateWindowExW(
         0,
         L"ScreenLiveStreamMainWindow",
-        L"ScreenLiveStream Windows (FFmpeg D3D11VA 硬件加速)",
+        L"ScreenLiveStream Windows",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
         (screenW - winW) / 2,
         (screenH - winH) / 2,
@@ -584,7 +576,7 @@ void MainWindow::CreateReceiverWindow() {
     m_hwndReceiverView = CreateWindowExW(
         0,
         L"ScreenLiveStreamReceiverView",
-        L"ScreenLiveStream 投屏播放窗口 (FFmpeg D3D11VA)",
+        L"ScreenLiveStream 投屏播放窗口",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         (screenW - winW) / 2,
         (screenH - winH) / 2,
@@ -651,6 +643,7 @@ void MainWindow::ReceiverDecodeLoop() {
     Logger::I("MainWindow", "Receiver Decode Loop thread started (FFmpeg Engine).");
     while (m_isDecoding) {
         ReceiverVideoPacket pkt;
+        bool isLatestInBatch = false;
         {
             std::unique_lock<std::mutex> lock(m_frameQueueMutex);
             m_frameQueueCv.wait(lock, [this] {
@@ -661,6 +654,9 @@ void MainWindow::ReceiverDecodeLoop() {
 
             pkt = std::move(m_frameQueue.front());
             m_frameQueue.pop_front();
+
+            // Decode all packets for P-frame reference continuity, but only present the latest frame in batch
+            isLatestInBatch = m_frameQueue.empty();
         }
 
         if (m_videoDecoder && !pkt.data.empty()) {
@@ -668,6 +664,7 @@ void MainWindow::ReceiverDecodeLoop() {
             if (m_videoDecoder->GetCodecType() != targetCodec) {
                 m_videoDecoder->Initialize(targetCodec);
             }
+            m_shouldRenderFrame.store(isLatestInBatch, std::memory_order_relaxed);
             m_videoDecoder->DecodeNalu(pkt.data.data(), pkt.data.size(), pkt.timestampMs);
         }
     }
@@ -715,7 +712,7 @@ bool MainWindow::StartReceiver() {
             PostMessage(m_hwnd, WM_USER_ADAPT_WINDOW, w, h);
         }
 
-        if (m_d3dRenderer) {
+        if (m_d3dRenderer && m_shouldRenderFrame.load(std::memory_order_relaxed)) {
             m_d3dRenderer->RenderFrame(tex, w, h);
         }
     });

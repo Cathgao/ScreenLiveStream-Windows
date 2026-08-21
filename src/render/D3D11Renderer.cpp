@@ -11,6 +11,8 @@ D3D11Renderer::~D3D11Renderer() {
 
 void D3D11Renderer::Shutdown() {
     std::lock_guard<std::mutex> lock(m_renderMutex);
+    m_inputView = nullptr;
+    m_lastFrameTexture = nullptr;
     m_outputView = nullptr;
     m_videoProcessor = nullptr;
     m_videoProcessorEnum = nullptr;
@@ -46,7 +48,7 @@ bool D3D11Renderer::Initialize(HWND hwnd, int width, int height) {
     }
 
     m_isInitialized = true;
-    Logger::I("D3D11Renderer", "Renderer initialized (" + std::to_string(m_windowWidth) + "x" + std::to_string(m_windowHeight) + ", Tearing=" + std::to_string(m_allowTearing) + ")");
+    Logger::I("D3D11Renderer", "Renderer initialized (" + std::to_string(m_windowWidth) + "x" + std::to_string(m_windowHeight) + ", V-Sync Enabled)");
     return true;
 }
 
@@ -62,13 +64,6 @@ bool D3D11Renderer::CreateSwapChain(int width, int height) {
     Microsoft::WRL::ComPtr<IDXGIFactory2> dxgiFactory;
     if (FAILED(dxgiAdapter->GetParent(IID_PPV_ARGS(&dxgiFactory)))) return false;
 
-    BOOL allowTearing = FALSE;
-    Microsoft::WRL::ComPtr<IDXGIFactory5> factory5;
-    if (SUCCEEDED(dxgiFactory.As(&factory5))) {
-        factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing));
-    }
-    m_allowTearing = (allowTearing == TRUE);
-
     DXGI_SWAP_CHAIN_DESC1 scDesc = {};
     scDesc.Width = width;
     scDesc.Height = height;
@@ -81,7 +76,7 @@ bool D3D11Renderer::CreateSwapChain(int width, int height) {
     scDesc.Scaling = DXGI_SCALING_STRETCH;
     scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scDesc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-    scDesc.Flags = m_allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    scDesc.Flags = 0;
 
     HRESULT hr = dxgiFactory->CreateSwapChainForHwnd(
         m_device.Get(),
@@ -113,12 +108,13 @@ void D3D11Renderer::Resize(int width, int height) {
     m_windowHeight = height;
 
     m_renderTargetView = nullptr;
+    m_inputView = nullptr;
+    m_lastFrameTexture = nullptr;
     m_outputView = nullptr;
     m_videoProcessor = nullptr;
     m_videoProcessorEnum = nullptr;
 
-    UINT flags = m_allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
-    m_swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, flags);
+    m_swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer;
     if (SUCCEEDED(m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) {
@@ -206,22 +202,24 @@ void D3D11Renderer::RenderFrame(ID3D11Texture2D* frameTexture, int videoWidth, i
         m_context->ClearRenderTargetView(m_renderTargetView.Get(), black);
     }
 
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inViewDesc = {};
-    inViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    inViewDesc.Texture2D.MipSlice = 0;
-    inViewDesc.Texture2D.ArraySlice = 0;
+    if (!m_inputView || m_lastFrameTexture != frameTexture) {
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inViewDesc = {};
+        inViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        inViewDesc.Texture2D.MipSlice = 0;
+        inViewDesc.Texture2D.ArraySlice = 0;
 
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> inputView;
-    HRESULT hr = m_videoDevice->CreateVideoProcessorInputView(frameTexture, m_videoProcessorEnum.Get(), &inViewDesc, &inputView);
-    if (FAILED(hr)) return;
+        m_inputView = nullptr;
+        HRESULT hr = m_videoDevice->CreateVideoProcessorInputView(frameTexture, m_videoProcessorEnum.Get(), &inViewDesc, &m_inputView);
+        if (FAILED(hr)) return;
+        m_lastFrameTexture = frameTexture;
+    }
 
     D3D11_VIDEO_PROCESSOR_STREAM stream = {};
     stream.Enable = TRUE;
-    stream.pInputSurface = inputView.Get();
+    stream.pInputSurface = m_inputView.Get();
 
-    hr = m_videoContext->VideoProcessorBlt(m_videoProcessor.Get(), m_outputView.Get(), 0, 1, &stream);
+    HRESULT hr = m_videoContext->VideoProcessorBlt(m_videoProcessor.Get(), m_outputView.Get(), 0, 1, &stream);
     if (SUCCEEDED(hr)) {
-        UINT presentFlags = m_allowTearing ? DXGI_PRESENT_ALLOW_TEARING : DXGI_PRESENT_DO_NOT_WAIT;
-        m_swapChain->Present(0, presentFlags);
+        m_swapChain->Present(1, 0);
     }
 }

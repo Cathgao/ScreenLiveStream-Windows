@@ -29,6 +29,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VideoContext> m_videoContext;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessor> m_videoProcessor;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> m_videoProcessorEnum;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> m_inputView;
+    ID3D11Texture2D* m_lastFrameTexture = nullptr;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> m_outputView;
 
     HWND m_hwnd = nullptr;
@@ -37,7 +39,6 @@ private:
     int m_lastVideoWidth = 0;
     int m_lastVideoHeight = 0;
     bool m_isInitialized = false;
-    bool m_allowTearing = false;
 
     std::mutex m_renderMutex;
 

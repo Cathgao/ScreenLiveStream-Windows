@@ -74,6 +74,7 @@ private:
     std::condition_variable m_frameQueueCv;
     std::deque<ReceiverVideoPacket> m_frameQueue;
     std::atomic<bool> m_isDecoding{ false };
+    std::atomic<bool> m_shouldRenderFrame{ true };
 
     void ReceiverDecodeLoop();
 
@@ -129,11 +130,7 @@ private:
     HWND m_lblProtocol = nullptr;
 
     // UI Theme Resources
-    HFONT m_hFontTitle = nullptr;
-    HFONT m_hFontHeader = nullptr;
     HFONT m_hFontNormal = nullptr;
-    HFONT m_hFontBold = nullptr;
-    HFONT m_hFontSmall = nullptr;
     HBRUSH m_hBrushBg = nullptr;
     HBRUSH m_hBrushCard = nullptr;
     HBRUSH m_hBrushInput = nullptr;
