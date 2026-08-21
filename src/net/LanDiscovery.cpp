@@ -17,52 +17,58 @@ struct NetInterfaceInfo {
 
 static std::vector<NetInterfaceInfo> GetLocalInterfaces() {
     std::vector<NetInterfaceInfo> interfaces;
-    ULONG outBufLen = 15000;
-    std::vector<BYTE> buffer(outBufLen);
-    PIP_ADAPTER_ADDRESSES pAddresses = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+    ULONG outBufLen = 16384;
+    PIP_ADAPTER_ADDRESSES pAddresses = (IP_ADAPTER_ADDRESSES*)malloc(outBufLen);
+    if (!pAddresses) return interfaces;
 
     ULONG flags = GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
     DWORD dwRetVal = GetAdaptersAddresses(AF_INET, flags, nullptr, pAddresses, &outBufLen);
     if (dwRetVal == ERROR_BUFFER_OVERFLOW) {
-        buffer.resize(outBufLen);
-        pAddresses = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+        free(pAddresses);
+        pAddresses = (IP_ADAPTER_ADDRESSES*)malloc(outBufLen);
+        if (!pAddresses) return interfaces;
         dwRetVal = GetAdaptersAddresses(AF_INET, flags, nullptr, pAddresses, &outBufLen);
     }
 
-    if (dwRetVal != NO_ERROR) {
-        return interfaces;
-    }
+    if (dwRetVal == NO_ERROR) {
+        try {
+            for (PIP_ADAPTER_ADDRESSES pCurr = pAddresses; pCurr != nullptr; pCurr = pCurr->Next) {
+                if (pCurr->OperStatus != IfOperStatusUp) continue;
+                if (pCurr->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
 
-    for (PIP_ADAPTER_ADDRESSES pCurr = pAddresses; pCurr != nullptr; pCurr = pCurr->Next) {
-        if (pCurr->OperStatus != IfOperStatusUp) continue;
-        if (pCurr->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+                for (PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurr->FirstUnicastAddress; pUnicast != nullptr; pUnicast = pUnicast->Next) {
+                    if (pUnicast->Address.lpSockaddr && pUnicast->Address.lpSockaddr->sa_family == AF_INET) {
+                        auto* saIn = reinterpret_cast<sockaddr_in*>(pUnicast->Address.lpSockaddr);
+                        if (!saIn) continue;
 
-        for (PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurr->FirstUnicastAddress; pUnicast != nullptr; pUnicast = pUnicast->Next) {
-            if (pUnicast->Address.lpSockaddr->sa_family == AF_INET) {
-                auto* saIn = reinterpret_cast<sockaddr_in*>(pUnicast->Address.lpSockaddr);
-                uint32_t ip = ntohl(saIn->sin_addr.s_addr);
-                UINT8 prefixLen = pUnicast->OnLinkPrefixLength;
-                if (prefixLen == 0 || prefixLen > 32) prefixLen = 24;
+                        uint32_t ip = ntohl(saIn->sin_addr.s_addr);
+                        UINT8 prefixLen = pUnicast->OnLinkPrefixLength;
+                        if (prefixLen == 0 || prefixLen > 32) prefixLen = 24;
 
-                uint32_t mask = (prefixLen == 0) ? 0 : (~0u << (32 - prefixLen));
-                uint32_t bcast = (ip & mask) | (~mask);
+                        uint32_t mask = (prefixLen == 0) ? 0 : (~0u << (32 - prefixLen));
+                        uint32_t bcast = (ip & mask) | (~mask);
 
-                char ipStr[INET_ADDRSTRLEN] = {};
-                inet_ntop(AF_INET, &saIn->sin_addr, ipStr, sizeof(ipStr));
-
-                struct in_addr bcastAddr;
-                bcastAddr.s_addr = htonl(bcast);
-                char bcastStr[INET_ADDRSTRLEN] = {};
-                inet_ntop(AF_INET, &bcastAddr, bcastStr, sizeof(bcastStr));
-
-                NetInterfaceInfo info;
-                info.ip = ipStr;
-                info.broadcastIp = bcastStr;
-                interfaces.push_back(info);
+                        char ipStr[INET_ADDRSTRLEN] = {};
+                        if (inet_ntop(AF_INET, &saIn->sin_addr, ipStr, sizeof(ipStr))) {
+                            struct in_addr bcastAddr;
+                            bcastAddr.s_addr = htonl(bcast);
+                            char bcastStr[INET_ADDRSTRLEN] = {};
+                            if (inet_ntop(AF_INET, &bcastAddr, bcastStr, sizeof(bcastStr))) {
+                                NetInterfaceInfo info;
+                                info.ip = ipStr;
+                                info.broadcastIp = bcastStr;
+                                interfaces.push_back(info);
+                            }
+                        }
+                    }
+                }
             }
-        }
+        } catch (...) {}
     }
 
+    if (pAddresses) {
+        free(pAddresses);
+    }
     return interfaces;
 }
 

@@ -9,6 +9,7 @@
 #include <thread>
 #include <atomic>
 #include <cstdint>
+#include <chrono>
 
 class WasapiPlayer {
 public:
@@ -46,6 +47,13 @@ private:
     std::atomic<int64_t> m_currentAudioPtsMs{ -1 };
     std::atomic<int64_t> m_lastAudioPtsLocalTimeMs{ 0 };
 
+    // 1-second Periodic Stats Tracking
+    std::chrono::steady_clock::time_point m_lastStatsTime;
+    uint32_t m_statsPruneEvents = 0;
+    uint32_t m_statsUnderruns = 0;
+    uint32_t m_statsPushedFrames = 0;
+
     void PlayThreadProc();
+    void LogPeriodicStats();
 };
 

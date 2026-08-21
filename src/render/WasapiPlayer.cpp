@@ -29,6 +29,11 @@ bool WasapiPlayer::Start(int sampleRate, int channels) {
     m_currentAudioPtsMs.store(-1, std::memory_order_relaxed);
     m_lastAudioPtsLocalTimeMs.store(0, std::memory_order_relaxed);
 
+    m_lastStatsTime = std::chrono::steady_clock::now();
+    m_statsPruneEvents = 0;
+    m_statsUnderruns = 0;
+    m_statsPushedFrames = 0;
+
     m_isPlaying.store(true, std::memory_order_release);
     m_playThread = std::thread(&WasapiPlayer::PlayThreadProc, this);
     return true;
@@ -67,6 +72,7 @@ void WasapiPlayer::PushPcm(const uint8_t* pcmData, size_t bytes, int64_t timesta
     const int16_t* pSrc = reinterpret_cast<const int16_t*>(pcmData);
 
     std::lock_guard<std::mutex> lock(m_queueMutex);
+    m_statsPushedFrames++;
 
     // Periodic compaction when offset exceeds 8K samples (~85ms)
     if (m_queueReadOffset > 8192) {
@@ -74,12 +80,18 @@ void WasapiPlayer::PushPcm(const uint8_t* pcmData, size_t bytes, int64_t timesta
         m_queueReadOffset = 0;
     }
 
-    // Ultra-low latency audio buffer cap (~75ms, approx 3.5 AAC frames) to strictly prevent audio latency accumulation
-    size_t maxBacklog = static_cast<size_t>((m_sampleRate * m_channels * 75) / 1000);
+    // Low latency audio buffer cap (~150ms, approx 7 AAC frames) to handle network packet bursts without jitter
+    size_t maxBacklog = static_cast<size_t>((m_sampleRate * m_channels * 150) / 1000);
     size_t activeSamples = m_pcmQueue.size() - m_queueReadOffset;
     if (activeSamples > maxBacklog) {
-        size_t targetActive = static_cast<size_t>((m_sampleRate * m_channels * 20) / 1000);
+        m_statsPruneEvents++;
+        size_t targetActive = static_cast<size_t>((m_sampleRate * m_channels * 40) / 1000);
         size_t pruneCount = (m_pcmQueue.size() > targetActive) ? (m_pcmQueue.size() - targetActive - m_queueReadOffset) : 0;
+        int64_t prunedMs = static_cast<int64_t>((pruneCount * 1000.0) / (m_sampleRate * m_channels));
+        Logger::W("WasapiPlayer", "[AUDIO_PRUNE] Backlog reached " + std::to_string(activeSamples * 1000 / (m_sampleRate * m_channels)) +
+                  " ms (>150ms max). Pruning " + std::to_string(pruneCount) + " samples (~" + std::to_string(prunedMs) +
+                  " ms) to avoid audio latency accumulation");
+
         m_queueReadOffset = (m_pcmQueue.size() > targetActive) ? (m_pcmQueue.size() - targetActive) : 0;
 
         // Prune PTS segments to stay synchronized with audio buffer truncation
@@ -410,6 +422,7 @@ void WasapiPlayer::PlayThreadProc() {
                             }
                             renderClient->ReleaseBuffer(numFramesAvailable, 0);
                         } else {
+                            m_statsUnderruns++;
                             softwareResamplePos = 0.0;
                             renderClient->ReleaseBuffer(numFramesAvailable, AUDCLNT_BUFFERFLAGS_SILENT);
                         }
@@ -417,6 +430,7 @@ void WasapiPlayer::PlayThreadProc() {
                 }
             }
         }
+        LogPeriodicStats();
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
@@ -430,6 +444,29 @@ void WasapiPlayer::PlayThreadProc() {
     }
     timeEndPeriod(1);
     CoUninitialize();
+}
+
+void WasapiPlayer::LogPeriodicStats() {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastStatsTime).count();
+    if (elapsedMs >= 1000) {
+        size_t bufferedSamples = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            bufferedSamples = (m_pcmQueue.size() > m_queueReadOffset) ? (m_pcmQueue.size() - m_queueReadOffset) : 0;
+        }
+        double bufferMs = (bufferedSamples * 1000.0) / (m_sampleRate * m_channels);
+        int64_t renderedPts = GetCurrentRenderedAudioPtsMs();
+        Logger::I("WasapiPlayer", "[STATS 1s] Rendered Audio PTS: " + std::to_string(renderedPts) +
+                  " ms, Buffer: " + std::to_string(bufferedSamples) + " samples (" + std::to_string(bufferMs) +
+                  " ms), In: " + std::to_string(m_statsPushedFrames) + " frames, Underruns: " +
+                  std::to_string(m_statsUnderruns) + ", Prunes: " + std::to_string(m_statsPruneEvents));
+
+        m_statsPruneEvents = 0;
+        m_statsUnderruns = 0;
+        m_statsPushedFrames = 0;
+        m_lastStatsTime = now;
+    }
 }
 
 

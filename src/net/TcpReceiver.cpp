@@ -13,6 +13,15 @@ bool TcpReceiver::Start(uint16_t listenPort) {
 
     m_listenPort = listenPort;
     m_isRunning = true;
+    m_lastSeq = -1;
+
+    m_lastStatsTime = std::chrono::steady_clock::now();
+    m_statsVideoFrames = 0;
+    m_statsKeyframes = 0;
+    m_statsAudioFrames = 0;
+    m_statsTotalRecvMs = 0.0;
+    m_statsIntervalBytes = 0;
+
     m_listenThread = std::thread(&TcpReceiver::ListenThreadProc, this);
     return true;
 }
@@ -106,6 +115,7 @@ void TcpReceiver::HandleClient(SOCKET clientSock) {
             break;
         }
         m_receivedBytes.fetch_add(20);
+        m_statsIntervalBytes += 20;
 
         if (headerBuf[0] != 0x51 || headerBuf[1] != 0x43) { // 'Q', 'C'
             Logger::W("TcpReceiver", "Invalid TCP packet magic, dropping connection.");
@@ -126,7 +136,6 @@ void TcpReceiver::HandleClient(SOCKET clientSock) {
         }
 
         uint32_t seq = (headerBuf[4] << 24) | (headerBuf[5] << 16) | (headerBuf[6] << 8) | headerBuf[7];
-        (void)seq;
 
         int64_t timestampMs = 0;
         for (int i = 0; i < 8; ++i) {
@@ -144,6 +153,7 @@ void TcpReceiver::HandleClient(SOCKET clientSock) {
             uint8_t statsBuf[8];
             if (RecvExact(clientSock, statsBuf, 8, m_isRunning)) {
                 m_receivedBytes.fetch_add(8);
+                m_statsIntervalBytes += 8;
                 int32_t rtt = (statsBuf[0] << 24) | (statsBuf[1] << 16) | (statsBuf[2] << 8) | statsBuf[3];
                 int32_t lossBp = (statsBuf[4] << 24) | (statsBuf[5] << 16) | (statsBuf[6] << 8) | statsBuf[7];
                 if (m_statsCallback) {
@@ -155,20 +165,62 @@ void TcpReceiver::HandleClient(SOCKET clientSock) {
 
         if (payloadSize > 0) {
             payloadBuf.resize(payloadSize);
+            auto recvStart = std::chrono::steady_clock::now();
             if (!RecvExact(clientSock, payloadBuf.data(), payloadSize, m_isRunning)) {
                 break;
             }
+            double recvMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - recvStart).count();
+            m_statsTotalRecvMs += recvMs;
             m_receivedBytes.fetch_add(payloadSize);
+            m_statsIntervalBytes += payloadSize;
+
+            if (recvMs > 25.0) {
+                Logger::W("TcpReceiver", "[SLOW_RECV] Frame #" + std::to_string(seq) + " (size=" +
+                          std::to_string(payloadSize) + " bytes, isAudio=" + std::to_string(isAudio) +
+                          ", isKey=" + std::to_string(isKeyframe) + ") took " + std::to_string(recvMs) + " ms over TCP");
+            }
         }
 
         if (isAudio) {
+            m_statsAudioFrames++;
             if (m_audioCallback && payloadSize > 0) {
                 m_audioCallback(payloadBuf.data(), payloadSize, timestampMs);
             }
         } else {
+            m_statsVideoFrames++;
+            if (isKeyframe) m_statsKeyframes++;
+            if (m_lastSeq >= 0 && seq != static_cast<uint32_t>(m_lastSeq + 1)) {
+                Logger::W("TcpReceiver", "[SEQ_JUMP] Video seq jump: prevSeq=" + std::to_string(m_lastSeq) +
+                          ", newSeq=" + std::to_string(seq));
+            }
+            m_lastSeq = static_cast<int32_t>(seq);
+
             if (m_videoCallback && payloadSize > 0) {
                 m_videoCallback(payloadBuf.data(), payloadSize, timestampMs, isKeyframe, isCodecConfig, isHevc);
             }
         }
+
+        LogPeriodicStats();
+    }
+}
+
+void TcpReceiver::LogPeriodicStats() {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastStatsTime).count();
+    if (elapsedMs >= 1000) {
+        double mbps = (m_statsIntervalBytes * 8.0) / (elapsedMs * 1000.0);
+        uint32_t totalFrames = m_statsVideoFrames + m_statsAudioFrames;
+        double avgRecvMs = totalFrames > 0 ? (m_statsTotalRecvMs / totalFrames) : 0.0;
+        Logger::I("TcpReceiver", "[STATS 1s] Recv: " + std::to_string(m_statsVideoFrames) + " video frames (" +
+                  std::to_string(m_statsKeyframes) + " keyframes), " + std::to_string(m_statsAudioFrames) +
+                  " audio frames (" + std::to_string(mbps) + " Mbps), Avg Payload Recv: " +
+                  std::to_string(avgRecvMs) + " ms");
+
+        m_statsVideoFrames = 0;
+        m_statsKeyframes = 0;
+        m_statsAudioFrames = 0;
+        m_statsTotalRecvMs = 0.0;
+        m_statsIntervalBytes = 0;
+        m_lastStatsTime = now;
     }
 }

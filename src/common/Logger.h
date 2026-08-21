@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <mutex>
 #include <chrono>
@@ -40,6 +41,13 @@ public:
 
         std::string str = ss.str();
         OutputDebugStringA(str.c_str());
+        std::cout << str;
+
+        std::ofstream& file = GetLogFile();
+        if (file.is_open()) {
+            file << str;
+            file.flush();
+        }
     }
 
     static void D(const std::string& tag, const std::string& msg) { Log(LogLevel::Debug, tag, msg); }
@@ -51,5 +59,10 @@ private:
     static std::mutex& GetMutex() {
         static std::mutex s_mutex;
         return s_mutex;
+    }
+
+    static std::ofstream& GetLogFile() {
+        static std::ofstream s_logFile("ScreenLiveStream.log", std::ios::out | std::ios::app);
+        return s_logFile;
     }
 };

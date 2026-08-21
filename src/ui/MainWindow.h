@@ -67,6 +67,7 @@ private:
         bool isKeyframe = false;
         bool isCodecConfig = false;
         bool isHevc = false;
+        std::chrono::steady_clock::time_point enqueueTime;
     };
 
     std::thread m_receiverDecodeThread;
@@ -75,6 +76,16 @@ private:
     std::deque<ReceiverVideoPacket> m_frameQueue;
     std::atomic<bool> m_isDecoding{ false };
     std::atomic<bool> m_shouldRenderFrame{ true };
+
+    // Receiver Engine Diagnostic Telemetry
+    std::atomic<uint32_t> m_statsQueueEnqueued{ 0 };
+    std::atomic<uint32_t> m_statsQueueDrops{ 0 };
+    std::atomic<uint32_t> m_statsRenderedFrames{ 0 };
+    std::atomic<uint32_t> m_statsSkippedFramesAvSync{ 0 };
+    std::atomic<uint32_t> m_statsSkippedFramesVideoSync{ 0 };
+    std::atomic<uint32_t> m_statsSleepWaitCount{ 0 };
+    std::atomic<int64_t> m_statsTotalSleepWaitMs{ 0 };
+    std::atomic<double> m_statsTotalQueueDelayMs{ 0.0 };
 
     void ReceiverDecodeLoop();
 

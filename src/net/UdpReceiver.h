@@ -51,11 +51,14 @@ private:
         uint32_t frameSize = 0;
         int64_t timestampMs = 0;
         uint8_t flags = 0;
+        uint8_t fecGroupSize = 10;
         std::vector<uint8_t> frameBytes;
         std::vector<bool> receivedFragments;
         int receivedDataCount = 0;
         std::unordered_map<int, std::vector<uint8_t>> fecPackets; // groupId -> payload
+        std::chrono::steady_clock::time_point firstArrivalTime;
         std::chrono::steady_clock::time_point lastUpdate;
+        int fecRecoveredCount = 0;
         bool isCompleted = false;
 
         size_t GetExpectedFragLength(size_t index) const {
@@ -66,9 +69,27 @@ private:
 
     std::unordered_map<int32_t, UdpvFrameBuffer> m_udpvBuffers;
     int32_t m_lastAssembledSeq = -1;
+    int32_t m_lastSeenSeq = -1;
+
+    // 1-second Periodic Stats Tracking
+    std::chrono::steady_clock::time_point m_lastStatsTime;
+    uint32_t m_statsPacketsRecv = 0;
+    uint32_t m_statsFramesAssembled = 0;
+    uint32_t m_statsKeyframes = 0;
+    uint32_t m_statsFramesDiscarded = 0;
+    uint32_t m_statsFecRecovered = 0;
+    uint32_t m_statsSeqJumps = 0;
+    double m_statsTotalAssemblyMs = 0.0;
+    uint64_t m_statsIntervalBytes = 0;
+
+    sockaddr_in m_senderAddr = {};
+    bool m_hasSenderAddr = false;
+    std::chrono::steady_clock::time_point m_lastKeyframeRequestTime;
 
     void RecvThreadProc();
     void ProcessUdpvPacket(const uint8_t* buffer, int length, const sockaddr_in& senderAddr);
     void CheckAndAssembleUdpv(UdpvFrameBuffer& fb);
     void CleanOldUdpvFrames(int32_t currentSeq);
+    void RequestKeyframe();
+    void LogPeriodicStats();
 };

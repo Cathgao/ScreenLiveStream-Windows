@@ -9,6 +9,7 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <chrono>
 
 class TcpReceiver {
 public:
@@ -43,6 +44,16 @@ private:
     AudioFrameCallback m_audioCallback;
     StatsCallback m_statsCallback;
 
+    // 1-second Periodic Stats Tracking
+    std::chrono::steady_clock::time_point m_lastStatsTime;
+    uint32_t m_statsVideoFrames = 0;
+    uint32_t m_statsKeyframes = 0;
+    uint32_t m_statsAudioFrames = 0;
+    double m_statsTotalRecvMs = 0.0;
+    uint64_t m_statsIntervalBytes = 0;
+    int32_t m_lastSeq = -1;
+
     void ListenThreadProc();
     void HandleClient(SOCKET clientSock);
+    void LogPeriodicStats();
 };

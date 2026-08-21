@@ -180,12 +180,24 @@ bool FfmpegVideoDecoder::Initialize(VideoCodecType codecType) {
     m_pkt = av_packet_alloc();
 
     m_isInitialized = true;
+    m_lastStatsTime = std::chrono::steady_clock::now();
+    m_statsFramesInput = 0;
+    m_statsFramesDecoded = 0;
+    m_statsHwFrames = 0;
+    m_statsSwFrames = 0;
+    m_statsTotalDecodeMs = 0.0;
+    m_statsMaxDecodeMs = 0.0;
+    m_statsErrors = 0;
+
     Logger::I("FfmpegVideoDecoder", "FFmpeg Video Decoder initialized successfully (" + codecName + ", HW=" + std::to_string(m_isHwAccelActive) + ")");
     return true;
 }
 
 bool FfmpegVideoDecoder::DecodeNalu(const uint8_t* data, size_t size, int64_t timestampMs) {
     if (!m_isInitialized || !m_codecCtx || !data || size == 0) return false;
+
+    auto decodeStart = std::chrono::steady_clock::now();
+    m_statsFramesInput++;
 
     if (m_paddedPktBuffer.size() < size + AV_INPUT_BUFFER_PADDING_SIZE) {
         m_paddedPktBuffer.resize(size + AV_INPUT_BUFFER_PADDING_SIZE + 4096);
@@ -200,7 +212,10 @@ bool FfmpegVideoDecoder::DecodeNalu(const uint8_t* data, size_t size, int64_t ti
 
     int ret = avcodec_send_packet(m_codecCtx, m_pkt);
     if (ret < 0 && ret != AVERROR(EAGAIN)) {
-        // Stream configuration / sync NALU
+        m_statsErrors++;
+        char errBuf[256] = {};
+        av_strerror(ret, errBuf, sizeof(errBuf));
+        Logger::W("FfmpegVideoDecoder", "[DECODE_SEND_ERR] avcodec_send_packet failed (" + std::to_string(ret) + "): " + errBuf);
     }
 
     while (ret >= 0) {
@@ -209,15 +224,31 @@ bool FfmpegVideoDecoder::DecodeNalu(const uint8_t* data, size_t size, int64_t ti
             break;
         }
         if (ret < 0) {
+            m_statsErrors++;
+            char errBuf[256] = {};
+            av_strerror(ret, errBuf, sizeof(errBuf));
+            Logger::W("FfmpegVideoDecoder", "[DECODE_RECV_ERR] avcodec_receive_frame failed (" + std::to_string(ret) + "): " + errBuf);
             break;
         }
 
+        m_statsFramesDecoded++;
         ProcessDecodedFrame(m_frame, timestampMs);
         av_frame_unref(m_frame);
     }
 
     m_pkt->data = nullptr;
     m_pkt->size = 0;
+
+    double decodeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - decodeStart).count();
+    m_statsTotalDecodeMs += decodeMs;
+    if (decodeMs > m_statsMaxDecodeMs) m_statsMaxDecodeMs = decodeMs;
+    if (decodeMs > 15.0) {
+        Logger::W("FfmpegVideoDecoder", "[SLOW_DECODE] Decode took " + std::to_string(decodeMs) +
+                  " ms for frame (size=" + std::to_string(size) + " bytes, pts=" + std::to_string(timestampMs) +
+                  ", HW=" + std::to_string(m_isHwAccelActive) + ")");
+    }
+
+    LogPeriodicStats();
     return true;
 }
 
@@ -226,6 +257,7 @@ void FfmpegVideoDecoder::ProcessDecodedFrame(AVFrame* frame, int64_t timestampMs
 
     // 1. Direct D3D11VA Hardware Accelerated Frame
     if (frame->format == AV_PIX_FMT_D3D11) {
+        m_statsHwFrames++;
         ID3D11Texture2D* hwTexture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);
         intptr_t sliceIndex = reinterpret_cast<intptr_t>(frame->data[1]);
 
@@ -247,6 +279,7 @@ void FfmpegVideoDecoder::ProcessDecodedFrame(AVFrame* frame, int64_t timestampMs
     }
 
     // 2. Software Fallback Frame (YUV420P / NV12 in CPU memory)
+    m_statsSwFrames++;
     AVFrame* srcFrame = frame;
     if (frame->format == AV_PIX_FMT_D3D11) {
         if (av_hwframe_transfer_data(m_swFrame, frame, 0) >= 0) {
@@ -299,5 +332,27 @@ void FfmpegVideoDecoder::ProcessDecodedFrame(AVFrame* frame, int64_t timestampMs
 
     if (srcFrame == m_swFrame) {
         av_frame_unref(m_swFrame);
+    }
+}
+
+void FfmpegVideoDecoder::LogPeriodicStats() {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastStatsTime).count();
+    if (elapsedMs >= 1000) {
+        double avgDecodeMs = m_statsFramesInput > 0 ? (m_statsTotalDecodeMs / m_statsFramesInput) : 0.0;
+        Logger::I("FfmpegVideoDecoder", "[STATS 1s] In: " + std::to_string(m_statsFramesInput) + " pkts, Decoded: " +
+                  std::to_string(m_statsFramesDecoded) + " frames (HW: " + std::to_string(m_statsHwFrames) +
+                  ", SW: " + std::to_string(m_statsSwFrames) + "), Avg Decode: " +
+                  std::to_string(avgDecodeMs) + " ms, Max: " + std::to_string(m_statsMaxDecodeMs) +
+                  " ms, Errors: " + std::to_string(m_statsErrors));
+
+        m_statsFramesInput = 0;
+        m_statsFramesDecoded = 0;
+        m_statsHwFrames = 0;
+        m_statsSwFrames = 0;
+        m_statsTotalDecodeMs = 0.0;
+        m_statsMaxDecodeMs = 0.0;
+        m_statsErrors = 0;
+        m_lastStatsTime = now;
     }
 }

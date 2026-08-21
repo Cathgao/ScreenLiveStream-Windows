@@ -11,8 +11,7 @@ D3D11Renderer::~D3D11Renderer() {
 
 void D3D11Renderer::Shutdown() {
     std::lock_guard<std::mutex> lock(m_renderMutex);
-    m_inputView = nullptr;
-    m_lastFrameTexture = nullptr;
+    m_inputViewCache.clear();
     m_outputView = nullptr;
     m_videoProcessor = nullptr;
     m_videoProcessorEnum = nullptr;
@@ -48,6 +47,11 @@ bool D3D11Renderer::Initialize(HWND hwnd, int width, int height) {
     }
 
     m_isInitialized = true;
+    m_lastStatsTime = std::chrono::steady_clock::now();
+    m_statsFramesRendered = 0;
+    m_statsTotalRenderMs = 0.0;
+    m_statsMaxRenderMs = 0.0;
+
     Logger::I("D3D11Renderer", "Renderer initialized (" + std::to_string(m_windowWidth) + "x" + std::to_string(m_windowHeight) + ", V-Sync Enabled)");
     return true;
 }
@@ -64,6 +68,13 @@ bool D3D11Renderer::CreateSwapChain(int width, int height) {
     Microsoft::WRL::ComPtr<IDXGIFactory2> dxgiFactory;
     if (FAILED(dxgiAdapter->GetParent(IID_PPV_ARGS(&dxgiFactory)))) return false;
 
+    BOOL allowTearing = FALSE;
+    Microsoft::WRL::ComPtr<IDXGIFactory5> factory5;
+    if (SUCCEEDED(dxgiFactory.As(&factory5))) {
+        factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing));
+    }
+    m_allowTearing = (allowTearing == TRUE);
+
     DXGI_SWAP_CHAIN_DESC1 scDesc = {};
     scDesc.Width = width;
     scDesc.Height = height;
@@ -72,11 +83,11 @@ bool D3D11Renderer::CreateSwapChain(int width, int height) {
     scDesc.SampleDesc.Count = 1;
     scDesc.SampleDesc.Quality = 0;
     scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scDesc.BufferCount = 2;
+    scDesc.BufferCount = 3; // Triple buffering
     scDesc.Scaling = DXGI_SCALING_STRETCH;
     scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scDesc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-    scDesc.Flags = 0;
+    scDesc.Flags = m_allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
 
     HRESULT hr = dxgiFactory->CreateSwapChainForHwnd(
         m_device.Get(),
@@ -91,6 +102,8 @@ bool D3D11Renderer::CreateSwapChain(int width, int height) {
         Logger::E("D3D11Renderer", "Failed to create SwapChainForHwnd, hr = " + std::to_string(hr));
         return false;
     }
+
+    dxgiFactory->MakeWindowAssociation(m_hwnd, DXGI_MWA_NO_ALT_ENTER);
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer;
     hr = m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
@@ -108,17 +121,22 @@ void D3D11Renderer::Resize(int width, int height) {
     m_windowHeight = height;
 
     m_renderTargetView = nullptr;
-    m_inputView = nullptr;
-    m_lastFrameTexture = nullptr;
+    m_inputViewCache.clear();
     m_outputView = nullptr;
     m_videoProcessor = nullptr;
     m_videoProcessorEnum = nullptr;
 
-    m_swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+    if (m_context) {
+        m_context->ClearState();
+        m_context->Flush();
+    }
 
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer;
-    if (SUCCEEDED(m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) {
-        m_device->CreateRenderTargetView(backBuffer.Get(), nullptr, &m_renderTargetView);
+    HRESULT hr = m_swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+    if (SUCCEEDED(hr)) {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer;
+        if (SUCCEEDED(m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) {
+            m_device->CreateRenderTargetView(backBuffer.Get(), nullptr, &m_renderTargetView);
+        }
     }
 }
 
@@ -132,6 +150,7 @@ bool D3D11Renderer::SetupVideoProcessor(int inWidth, int inHeight, DXGI_FORMAT i
 
     m_lastVideoWidth = inWidth;
     m_lastVideoHeight = inHeight;
+    m_inputViewCache.clear();
 
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC contentDesc = {};
     contentDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -139,7 +158,7 @@ bool D3D11Renderer::SetupVideoProcessor(int inWidth, int inHeight, DXGI_FORMAT i
     contentDesc.InputHeight = inHeight;
     contentDesc.OutputWidth = m_windowWidth;
     contentDesc.OutputHeight = m_windowHeight;
-    contentDesc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    contentDesc.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
 
     HRESULT hr = m_videoDevice->CreateVideoProcessorEnumerator(&contentDesc, &m_videoProcessorEnum);
     if (FAILED(hr)) return false;
@@ -162,6 +181,8 @@ void D3D11Renderer::RenderFrame(ID3D11Texture2D* frameTexture, int videoWidth, i
     (void)statsText;
     std::lock_guard<std::mutex> lock(m_renderMutex);
     if (!m_isInitialized || !m_swapChain || !frameTexture || !m_videoContext || !m_context) return;
+
+    auto renderStart = std::chrono::steady_clock::now();
 
     D3D11_TEXTURE2D_DESC desc;
     frameTexture->GetDesc(&desc);
@@ -197,29 +218,48 @@ void D3D11Renderer::RenderFrame(ID3D11Texture2D* frameTexture, int videoWidth, i
     m_videoContext->VideoProcessorSetStreamSourceRect(m_videoProcessor.Get(), 0, TRUE, &srcRect);
     m_videoContext->VideoProcessorSetStreamDestRect(m_videoProcessor.Get(), 0, TRUE, &destRect);
 
-    if (m_renderTargetView) {
-        const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-        m_context->ClearRenderTargetView(m_renderTargetView.Get(), black);
-    }
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inViewDesc = {};
+    inViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    inViewDesc.Texture2D.MipSlice = 0;
+    inViewDesc.Texture2D.ArraySlice = 0;
 
-    if (!m_inputView || m_lastFrameTexture != frameTexture) {
-        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inViewDesc = {};
-        inViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-        inViewDesc.Texture2D.MipSlice = 0;
-        inViewDesc.Texture2D.ArraySlice = 0;
-
-        m_inputView = nullptr;
-        HRESULT hr = m_videoDevice->CreateVideoProcessorInputView(frameTexture, m_videoProcessorEnum.Get(), &inViewDesc, &m_inputView);
-        if (FAILED(hr)) return;
-        m_lastFrameTexture = frameTexture;
-    }
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> inputView;
+    HRESULT hr = m_videoDevice->CreateVideoProcessorInputView(frameTexture, m_videoProcessorEnum.Get(), &inViewDesc, &inputView);
+    if (FAILED(hr)) return;
 
     D3D11_VIDEO_PROCESSOR_STREAM stream = {};
     stream.Enable = TRUE;
-    stream.pInputSurface = m_inputView.Get();
+    stream.pInputSurface = inputView.Get();
 
-    HRESULT hr = m_videoContext->VideoProcessorBlt(m_videoProcessor.Get(), m_outputView.Get(), 0, 1, &stream);
+    hr = m_videoContext->VideoProcessorBlt(m_videoProcessor.Get(), m_outputView.Get(), 0, 1, &stream);
     if (SUCCEEDED(hr)) {
-        m_swapChain->Present(0, 0);
+        UINT presentFlags = m_allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
+        m_swapChain->Present(0, presentFlags);
+    }
+
+    double renderMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - renderStart).count();
+    m_statsFramesRendered++;
+    m_statsTotalRenderMs += renderMs;
+    if (renderMs > m_statsMaxRenderMs) m_statsMaxRenderMs = renderMs;
+    if (renderMs > 10.0) {
+        Logger::W("D3D11Renderer", "[SLOW_RENDER] Render & Present took " + std::to_string(renderMs) +
+                  " ms for " + std::to_string(inW) + "x" + std::to_string(inH));
+    }
+
+    LogPeriodicStats();
+}
+
+void D3D11Renderer::LogPeriodicStats() {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastStatsTime).count();
+    if (elapsedMs >= 1000) {
+        double avgRenderMs = m_statsFramesRendered > 0 ? (m_statsTotalRenderMs / m_statsFramesRendered) : 0.0;
+        Logger::I("D3D11Renderer", "[STATS 1s] Rendered: " + std::to_string(m_statsFramesRendered) +
+                  " frames, Avg Render: " + std::to_string(avgRenderMs) + " ms, Max: " +
+                  std::to_string(m_statsMaxRenderMs) + " ms");
+        m_statsFramesRendered = 0;
+        m_statsTotalRenderMs = 0.0;
+        m_statsMaxRenderMs = 0.0;
+        m_lastStatsTime = now;
     }
 }

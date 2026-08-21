@@ -5,6 +5,7 @@
 #include <string>
 #include <atomic>
 #include <vector>
+#include <chrono>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -57,8 +58,19 @@ private:
 
     DecodedFrameCallback m_decodedCallback;
 
+    // 1-second Periodic Stats Tracking
+    std::chrono::steady_clock::time_point m_lastStatsTime;
+    uint32_t m_statsFramesInput = 0;
+    uint32_t m_statsFramesDecoded = 0;
+    uint32_t m_statsHwFrames = 0;
+    uint32_t m_statsSwFrames = 0;
+    double m_statsTotalDecodeMs = 0.0;
+    double m_statsMaxDecodeMs = 0.0;
+    uint32_t m_statsErrors = 0;
+
     static enum AVPixelFormat GetHwFormat(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts);
     bool EnsureRenderTexture(int width, int height);
     bool EnsureFallbackTexture(int width, int height);
     void ProcessDecodedFrame(AVFrame* frame, int64_t timestampMs);
+    void LogPeriodicStats();
 };

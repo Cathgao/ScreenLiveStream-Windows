@@ -817,10 +817,8 @@ void MainWindow::AutoAdaptReceiverWindow(int videoW, int videoH) {
 }
 
 void MainWindow::ReceiverDecodeLoop() {
-    Logger::I("MainWindow", "Receiver Decode Loop thread started (Auto A/V Sync Engine).");
-
-    int64_t syncAnchorVideoPts = -1;
-    int64_t syncAnchorLocalMs = -1;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    Logger::I("MainWindow", "Receiver Decode Loop thread started (Ultra Low-Latency Direct Pipeline).");
 
     while (m_isDecoding) {
         ReceiverVideoPacket pkt;
@@ -838,62 +836,20 @@ void MainWindow::ReceiverDecodeLoop() {
 
         if (!m_videoDecoder || pkt.data.empty()) continue;
 
+        double queueWaitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pkt.enqueueTime).count();
+        m_statsTotalQueueDelayMs.store(m_statsTotalQueueDelayMs.load() + queueWaitMs);
+        if (queueWaitMs > 30.0) {
+            Logger::W("MainWindow", "[QUEUE_DELAY] Packet waited " + std::to_string(queueWaitMs) +
+                      " ms in queue before decode (timestampMs=" + std::to_string(pkt.timestampMs) + ", isKey=" + std::to_string(pkt.isKeyframe) + ")");
+        }
+
         VideoCodecType targetCodec = pkt.isHevc ? VideoCodecType::H265_HEVC : VideoCodecType::H264;
         if (m_videoDecoder->GetCodecType() != targetCodec) {
             m_videoDecoder->Initialize(targetCodec);
         }
 
-        // Automatic A/V Synchronization Strategy
-        int64_t currentAudioPts = (m_wasapiPlayer && m_wasapiPlayer->IsPlaying())
-                                    ? m_wasapiPlayer->GetCurrentRenderedAudioPtsMs()
-                                    : -1;
-        int64_t nowMs = Protocol::GetCurrentMillis();
-        bool shouldRender = true;
-
-        if (pkt.timestampMs >= 0) {
-            if (currentAudioPts >= 0) {
-                // Audio is actively playing: synchronize Video PTS directly to Audio PTS (Audio Master Clock)
-                syncAnchorVideoPts = -1;
-                int64_t diff = pkt.timestampMs - currentAudioPts;
-
-                if (std::abs(diff) > 2000) {
-                    // Time discontinuity (e.g. stream restart / reconnection), render immediately
-                    shouldRender = true;
-                } else if (diff < -35) {
-                    // Video is late (>35ms behind Audio): decode for reference, but skip render to catch up immediately!
-                    shouldRender = false;
-                } else if (diff > 5) {
-                    // Video is ahead of Audio (e.g. video arrived earlier than audio output):
-                    // Sleep briefly so video matches audio playback time!
-                    int64_t waitMs = (std::min)(diff, (int64_t)80);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
-                    shouldRender = true;
-                } else {
-                    // Within [-35ms, 5ms] sync window: perfect match!
-                    shouldRender = true;
-                }
-            } else {
-                // Video-only mode (Audio absent or silent): smooth local clock pacing
-                if (syncAnchorVideoPts < 0 || std::abs((nowMs - syncAnchorLocalMs) - (pkt.timestampMs - syncAnchorVideoPts)) > 1000) {
-                    syncAnchorVideoPts = pkt.timestampMs;
-                    syncAnchorLocalMs = nowMs;
-                }
-                int64_t expectedTimeMs = syncAnchorLocalMs + (pkt.timestampMs - syncAnchorVideoPts);
-                int64_t waitMs = expectedTimeMs - nowMs;
-                if (waitMs > 2) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds((std::min)(waitMs, (int64_t)50)));
-                    shouldRender = true;
-                } else if (waitMs < -35) {
-                    // Video running late, skip render to catch up
-                    shouldRender = false;
-                    syncAnchorLocalMs = nowMs - (pkt.timestampMs - syncAnchorVideoPts); // smoothly re-anchor
-                } else {
-                    shouldRender = true;
-                }
-            }
-        }
-
-        m_shouldRenderFrame.store(shouldRender, std::memory_order_relaxed);
+        // Direct Presentation: Always render immediately as soon as decoded
+        m_shouldRenderFrame.store(true, std::memory_order_relaxed);
         m_videoDecoder->DecodeNalu(pkt.data.data(), pkt.data.size(), pkt.timestampMs);
     }
     Logger::I("MainWindow", "Receiver Decode Loop thread terminated.");
@@ -909,6 +865,16 @@ bool MainWindow::StartReceiver() {
     bool isUdp = (protoIdx == 0);
 
     CreateReceiverWindow();
+
+    // Reset Engine Telemetry Stats
+    m_statsQueueEnqueued = 0;
+    m_statsQueueDrops = 0;
+    m_statsRenderedFrames = 0;
+    m_statsSkippedFramesAvSync = 0;
+    m_statsSkippedFramesVideoSync = 0;
+    m_statsSleepWaitCount = 0;
+    m_statsTotalSleepWaitMs = 0;
+    m_statsTotalQueueDelayMs.store(0.0);
 
     // 1. Audio Decoder & Player
     m_wasapiPlayer = std::make_unique<WasapiPlayer>();
@@ -942,6 +908,7 @@ bool MainWindow::StartReceiver() {
         }
 
         if (m_d3dRenderer && m_shouldRenderFrame.load(std::memory_order_relaxed)) {
+            m_statsRenderedFrames.fetch_add(1);
             m_d3dRenderer->RenderFrame(tex, w, h);
         }
     });
@@ -962,15 +929,17 @@ bool MainWindow::StartReceiver() {
             pkt.isKeyframe = isKeyframe;
             pkt.isCodecConfig = isCodecConfig;
             pkt.isHevc = isHevc;
+            pkt.enqueueTime = std::chrono::steady_clock::now();
+            m_statsQueueEnqueued.fetch_add(1);
 
             {
                 std::lock_guard<std::mutex> lock(m_frameQueueMutex);
-                if (isKeyframe && m_frameQueue.size() > 3) {
+                if (isKeyframe && m_frameQueue.size() > 2) {
+                    size_t dropped = m_frameQueue.size();
+                    m_statsQueueDrops.fetch_add(static_cast<uint32_t>(dropped));
+                    Logger::W("MainWindow", "[QUEUE_DROP] Keyframe received with " + std::to_string(dropped) +
+                              " backlogged frames. Clearing queue to reset latency!");
                     m_frameQueue.clear();
-                } else if (m_frameQueue.size() > 30) {
-                    while (m_frameQueue.size() > 10) {
-                        m_frameQueue.pop_front();
-                    }
                 }
                 m_frameQueue.push_back(std::move(pkt));
             }
@@ -997,15 +966,17 @@ bool MainWindow::StartReceiver() {
             pkt.isKeyframe = isKeyframe;
             pkt.isCodecConfig = isCodecConfig;
             pkt.isHevc = isHevc;
+            pkt.enqueueTime = std::chrono::steady_clock::now();
+            m_statsQueueEnqueued.fetch_add(1);
 
             {
                 std::lock_guard<std::mutex> lock(m_frameQueueMutex);
-                if (isKeyframe && m_frameQueue.size() > 3) {
+                if (isKeyframe && m_frameQueue.size() > 2) {
+                    size_t dropped = m_frameQueue.size();
+                    m_statsQueueDrops.fetch_add(static_cast<uint32_t>(dropped));
+                    Logger::W("MainWindow", "[QUEUE_DROP] Keyframe received with " + std::to_string(dropped) +
+                              " backlogged frames. Clearing queue to reset latency!");
                     m_frameQueue.clear();
-                } else if (m_frameQueue.size() > 30) {
-                    while (m_frameQueue.size() > 10) {
-                        m_frameQueue.pop_front();
-                    }
                 }
                 m_frameQueue.push_back(std::move(pkt));
             }
@@ -1509,6 +1480,31 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     }
                     pThis->m_statFps = pThis->m_fpsCounter.exchange(0);
                     pThis->UpdateStatusText();
+
+                    uint32_t enqueued = pThis->m_statsQueueEnqueued.exchange(0);
+                    uint32_t drops = pThis->m_statsQueueDrops.exchange(0);
+                    uint32_t rendered = pThis->m_statsRenderedFrames.exchange(0);
+                    uint32_t avSkips = pThis->m_statsSkippedFramesAvSync.exchange(0);
+                    uint32_t vidSkips = pThis->m_statsSkippedFramesVideoSync.exchange(0);
+                    uint32_t sleepCount = pThis->m_statsSleepWaitCount.exchange(0);
+                    int64_t sleepMs = pThis->m_statsTotalSleepWaitMs.exchange(0);
+                    double totalQueueDelay = pThis->m_statsTotalQueueDelayMs.exchange(0.0);
+                    double avgQueueDelay = enqueued > 0 ? (totalQueueDelay / enqueued) : 0.0;
+                    size_t curQueueLen = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(pThis->m_frameQueueMutex);
+                        curQueueLen = pThis->m_frameQueue.size();
+                    }
+                    int64_t audioPts = (pThis->m_wasapiPlayer && pThis->m_wasapiPlayer->IsPlaying())
+                                           ? pThis->m_wasapiPlayer->GetCurrentRenderedAudioPtsMs()
+                                           : -1;
+                    Logger::I("MainWindow", "[ENGINE_STATS 1s] Queue: " + std::to_string(curQueueLen) +
+                              " frames (Enqueued: " + std::to_string(enqueued) + ", Drops: " + std::to_string(drops) +
+                              ", AvgQueueDelay: " + std::to_string(avgQueueDelay) + " ms), Rendered: " +
+                              std::to_string(rendered) + " frames, RenderSkipped: " + std::to_string(avSkips + vidSkips) +
+                              " (AV-late: " + std::to_string(avSkips) + ", Video-late: " + std::to_string(vidSkips) +
+                              "), SyncSleep: " + std::to_string(sleepCount) + " times (total " + std::to_string(sleepMs) +
+                              " ms), AudioMasterPTS: " + std::to_string(audioPts) + " ms");
                 } else {
                     pThis->m_statFps = 0;
                     pThis->m_statBitrateKbps = 0;
