@@ -157,6 +157,7 @@ bool WmfVideoEncoder::ConvertBgraToNv12(ID3D11Texture2D* bgraTexture) {
 static bool TrySetupEncoder(
     IMFTransform* encoder,
     IMFDXGIDeviceManager* dxgiManager,
+    ID3D11Texture2D* nv12Texture,
     GUID targetSubtype,
     int width,
     int height,
@@ -167,8 +168,14 @@ static bool TrySetupEncoder(
     if (!encoder) return false;
 
     Microsoft::WRL::ComPtr<IMFAttributes> attributes;
+    bool isAsync = false;
     if (SUCCEEDED(encoder->GetAttributes(&attributes)) && attributes) {
-        attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+        UINT32 asyncVal = 0;
+        attributes->GetUINT32(MF_TRANSFORM_ASYNC, &asyncVal);
+        isAsync = (asyncVal != 0);
+        if (isAsync) {
+            attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+        }
         attributes->SetUINT32(MF_LOW_LATENCY, TRUE);
     }
 
@@ -287,6 +294,29 @@ static bool TrySetupEncoder(
 
     encoder->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     encoder->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+    // 4. Verification: Test encode 1 frame to verify encoder accepts input and does not reject with MF_E_NOTACCEPTING
+    if (nv12Texture) {
+        Microsoft::WRL::ComPtr<IMFMediaBuffer> testBuffer;
+        if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12Texture, 0, FALSE, &testBuffer)) && testBuffer) {
+            Microsoft::WRL::ComPtr<IMFSample> testSample;
+            if (SUCCEEDED(MFCreateSample(&testSample)) && testSample) {
+                testSample->AddBuffer(testBuffer.Get());
+                testSample->SetSampleTime(0);
+                testSample->SetSampleDuration(10000000LL / (fps > 0 ? fps : 60));
+
+                hr = encoder->ProcessInput(0, testSample.Get(), 0);
+                if (FAILED(hr)) {
+                    Logger::W("WmfVideoEncoder", "Candidate rejected test ProcessInput, hr = 0x" + std::to_string(hr));
+                    return false;
+                }
+                encoder->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+                encoder->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+                encoder->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+            }
+        }
+    }
+
     return true;
 }
 
@@ -321,24 +351,12 @@ bool WmfVideoEncoder::Initialize(
 
         HRESULT hr = MFTEnumEx(
             MFT_CATEGORY_VIDEO_ENCODER,
-            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+            MFT_ENUM_FLAG_ALL | MFT_ENUM_FLAG_SORTANDFILTER,
             nullptr,
             &outputTypeInfo,
             &ppActivate,
             &count
         );
-
-        if (FAILED(hr) || count == 0) {
-            Logger::W("WmfVideoEncoder", "No hardware " + name + " encoder found, querying all encoders...");
-            hr = MFTEnumEx(
-                MFT_CATEGORY_VIDEO_ENCODER,
-                MFT_ENUM_FLAG_ALL | MFT_ENUM_FLAG_SORTANDFILTER,
-                nullptr,
-                &outputTypeInfo,
-                &ppActivate,
-                &count
-            );
-        }
 
         Logger::I("WmfVideoEncoder", "Found " + std::to_string(count) + " candidates for " + name);
 
@@ -353,9 +371,9 @@ bool WmfVideoEncoder::Initialize(
             Microsoft::WRL::ComPtr<IMFTransform> encoder;
             hr = ppActivate[i]->ActivateObject(IID_PPV_ARGS(&encoder));
             if (SUCCEEDED(hr) && encoder) {
-                if (TrySetupEncoder(encoder.Get(), m_dxgiManager.Get(), subtype, m_width, m_height, m_fps, m_bitrateKbps, m_codecApi)) {
+                if (TrySetupEncoder(encoder.Get(), m_dxgiManager.Get(), m_nv12Texture.Get(), subtype, m_width, m_height, m_fps, m_bitrateKbps, m_codecApi)) {
                     m_encoder = encoder;
-                    Logger::I("WmfVideoEncoder", "Successfully activated encoder: " + std::string(szName));
+                    Logger::I("WmfVideoEncoder", "Successfully activated verified encoder: " + std::string(szName));
                     for (UINT32 j = 0; j < count; ++j) ppActivate[j]->Release();
                     CoTaskMemFree(ppActivate);
                     return true;
@@ -465,21 +483,21 @@ bool WmfVideoEncoder::EncodeFrame(ID3D11Texture2D* bgraTexture, int64_t timestam
     sample->SetSampleDuration(sampleDurationHns);
 
     hr = m_encoder->ProcessInput(0, sample.Get(), 0);
-    if (FAILED(hr) && hr != MF_E_NOTACCEPTING) {
+    if (FAILED(hr)) {
         static int s_inErr = 0;
         if (s_inErr++ < 3) {
             Logger::W("WmfVideoEncoder", "ProcessInput failed, hr = 0x" + std::to_string(hr));
         }
     }
 
-    if (!m_eventGenerator) {
-        DrainOutput(timestampNs / 1000000);
-    }
+    DrainOutput(timestampNs / 1000000);
     return true;
 }
 
 void WmfVideoEncoder::DrainOutput(int64_t timestampMs) {
     if (!m_encoder) return;
+
+    std::lock_guard<std::mutex> lock(m_drainMutex);
 
     MFT_OUTPUT_STREAM_INFO streamInfo = {};
     HRESULT hrInfo = m_encoder->GetOutputStreamInfo(0, &streamInfo);
@@ -518,46 +536,143 @@ void WmfVideoEncoder::DrainOutput(int64_t timestampMs) {
             BYTE* pData = nullptr;
             DWORD maxLen = 0, currentLen = 0;
             if (SUCCEEDED(buffer->Lock(&pData, &maxLen, &currentLen)) && pData && currentLen > 0) {
-                UINT32 isKeyframeAttr = 0;
-                pSample->GetUINT32(MFSampleExtension_CleanPoint, &isKeyframeAttr);
-                bool isKeyframe = (isKeyframeAttr != 0);
                 bool isHevc = (m_codecType == VideoCodecType::H265_HEVC);
-                bool isCodecConfig = false;
+                UINT32 isCleanPoint = 0;
+                pSample->GetUINT32(MFSampleExtension_CleanPoint, &isCleanPoint);
+                bool hasKeyNal = false;
+                bool hasSliceNal = false;
 
-                if (!isHevc) {
-                    for (DWORD i = 0; i + 3 < currentLen; ++i) {
-                        if ((i + 4 <= currentLen && pData[i] == 0 && pData[i+1] == 0 && pData[i+2] == 0 && pData[i+3] == 1) ||
-                            (pData[i] == 0 && pData[i+1] == 0 && pData[i+2] == 1)) {
-                            int scLen = (pData[i+2] == 1) ? 3 : 4;
-                            if (i + scLen < currentLen) {
-                                uint8_t nal = pData[i + scLen] & 0x1F;
-                                if (nal == 7 || nal == 8) isCodecConfig = true;
-                                if (nal == 5) isKeyframe = true;
-                            }
+                // NAL unit scanning
+                struct NalSlice {
+                    size_t start;      // start of start code
+                    size_t header;     // start of NAL header byte
+                    size_t end;        // end of NAL
+                    uint8_t nalType;
+                    bool isParamSet;
+                    bool isKeyframe;
+                    bool isSlice;
+                };
+
+                std::vector<NalSlice> nals;
+                size_t i = 0;
+                int currentNalStart = -1;
+                int currentNalHeader = -1;
+                uint8_t currentNalType = 0;
+                bool currentIsParam = false;
+                bool currentIsKey = false;
+                bool currentIsSlice = false;
+
+                auto finishNal = [&](size_t endPos) {
+                    if (currentNalStart >= 0 && endPos > static_cast<size_t>(currentNalStart)) {
+                        nals.push_back({
+                            static_cast<size_t>(currentNalStart),
+                            static_cast<size_t>(currentNalHeader),
+                            endPos,
+                            currentNalType,
+                            currentIsParam,
+                            currentIsKey,
+                            currentIsSlice
+                        });
+                    }
+                };
+
+                while (i + 2 < currentLen) {
+                    int scLen = 0;
+                    if (pData[i] == 0 && pData[i + 1] == 0) {
+                        if (pData[i + 2] == 1) {
+                            scLen = 3;
+                        } else if (i + 3 < currentLen && pData[i + 2] == 0 && pData[i + 3] == 1) {
+                            scLen = 4;
                         }
                     }
-                } else {
-                    for (DWORD i = 0; i + 3 < currentLen; ++i) {
-                        if ((i + 4 <= currentLen && pData[i] == 0 && pData[i+1] == 0 && pData[i+2] == 0 && pData[i+3] == 1) ||
-                            (pData[i] == 0 && pData[i+1] == 0 && pData[i+2] == 1)) {
-                            int scLen = (pData[i+2] == 1) ? 3 : 4;
-                            if (i + scLen < currentLen) {
-                                uint8_t nal = (pData[i + scLen] >> 1) & 0x3F;
-                                if (nal == 32 || nal == 33 || nal == 34) isCodecConfig = true;
-                                if (nal == 19 || nal == 20 || nal == 21) isKeyframe = true;
+
+                    if (scLen > 0) {
+                        finishNal(i);
+                        currentNalStart = static_cast<int>(i);
+                        currentNalHeader = static_cast<int>(i + scLen);
+                        currentNalType = 0;
+                        currentIsParam = false;
+                        currentIsKey = false;
+                        currentIsSlice = false;
+
+                        if (currentNalHeader < static_cast<int>(currentLen)) {
+                            if (!isHevc) {
+                                currentNalType = pData[currentNalHeader] & 0x1F;
+                                currentIsParam = (currentNalType == 7 || currentNalType == 8); // SPS (7), PPS (8)
+                                currentIsKey = (currentNalType == 5); // IDR (5)
+                                currentIsSlice = (currentNalType == 1 || currentNalType == 5);
+                            } else {
+                                currentNalType = (pData[currentNalHeader] >> 1) & 0x3F;
+                                currentIsParam = (currentNalType == 32 || currentNalType == 33 || currentNalType == 34); // VPS (32), SPS (33), PPS (34)
+                                currentIsKey = (currentNalType == 19 || currentNalType == 20 || currentNalType == 21); // IDR/CRA
+                                currentIsSlice = (currentNalType >= 0 && currentNalType <= 21);
                             }
+                            if (currentIsKey) hasKeyNal = true;
+                            if (currentIsSlice) hasSliceNal = true;
                         }
+                        i += scLen;
+                    } else {
+                        i++;
+                    }
+                }
+                finishNal(currentLen);
+
+                // Collect Parameter Sets if present
+                std::vector<uint8_t> newParamSets;
+                for (const auto& nal : nals) {
+                    if (nal.isParamSet && nal.end > nal.start) {
+                        newParamSets.insert(newParamSets.end(), pData + nal.start, pData + nal.end);
                     }
                 }
 
-                if (isKeyframe) {
-                    static std::atomic<int> s_encodedFrames{ 0 };
-                    int fNum = ++s_encodedFrames;
-                    Logger::I("WmfVideoEncoder", "Encoded Keyframe #" + std::to_string(fNum) + " (" + std::to_string(currentLen) + " bytes, isHevc=" + std::to_string(isHevc) + ")");
+                if (!newParamSets.empty()) {
+                    m_cachedConfigData = std::move(newParamSets);
                 }
+
+                bool isKeyframe = hasKeyNal || (isCleanPoint != 0);
 
                 if (m_encodedCallback) {
-                    m_encodedCallback(pData, currentLen, timestampMs, isKeyframe, isCodecConfig, isHevc);
+                    // 1. If this is a keyframe (or parameter sets are present):
+                    // Send separate CodecConfig packet (csd-0/csd-1 for receiver MediaCodec initialization)
+                    if (isKeyframe && !m_cachedConfigData.empty()) {
+                        m_encodedCallback(
+                            m_cachedConfigData.data(),
+                            m_cachedConfigData.size(),
+                            timestampMs,
+                            false, /* isKeyframe */
+                            true,  /* isCodecConfig */
+                            isHevc
+                        );
+                    }
+
+                    // 2. If the buffer has video slice data or is a full frame:
+                    if (hasSliceNal || !nals.empty()) {
+                        if (isKeyframe) {
+                            static std::atomic<int> s_encodedFrames{ 0 };
+                            int fNum = ++s_encodedFrames;
+                            Logger::I("WmfVideoEncoder", "Encoded Keyframe #" + std::to_string(fNum) + " (" + std::to_string(currentLen) + " bytes, isHevc=" + std::to_string(isHevc) + ")");
+                        }
+
+                        // Send Keyframe / Delta frame
+                        m_encodedCallback(
+                            pData,
+                            currentLen,
+                            timestampMs,
+                            isKeyframe,
+                            false, /* isCodecConfig */
+                            isHevc
+                        );
+                    } else if (newParamSets.empty() && m_cachedConfigData.empty()) {
+                        // Fallback for raw packet without recognizable NAL
+                        m_encodedCallback(
+                            pData,
+                            currentLen,
+                            timestampMs,
+                            isKeyframe,
+                            false,
+                            isHevc
+                        );
+                    }
                 }
 
                 buffer->Unlock();

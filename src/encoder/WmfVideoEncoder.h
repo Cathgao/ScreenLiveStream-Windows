@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <mutex>
 
 enum class VideoCodecType {
     H264,
@@ -79,6 +80,7 @@ private:
 
     EncodedCallback m_encodedCallback;
     std::vector<uint8_t> m_cachedConfigData;
+    std::mutex m_drainMutex;
 
     Microsoft::WRL::ComPtr<IMFMediaEventGenerator> m_eventGenerator;
     std::thread m_eventThread;
