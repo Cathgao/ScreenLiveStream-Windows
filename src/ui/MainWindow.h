@@ -140,6 +140,7 @@ private:
     void InitControls();
     void RefreshCaptureTargets();
     void RefreshDiscoveredDevices();
+    void RefreshSupportedFps();
     void UpdateUiMode();
     void UpdateStatusText();
 

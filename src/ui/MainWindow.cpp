@@ -6,6 +6,7 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <set>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
@@ -219,12 +220,7 @@ void MainWindow::InitControls() {
     SetWindowTheme(m_comboBitrate, L"DarkMode_Explorer", nullptr);
 
     m_lblFps = CreateCardLabel(L"目标帧率:", 34, 288, 75, 22);
-    m_comboFps = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 112, 284, 140, 140, m_hwnd, (HMENU)ID_COMBO_FPS, m_hInstance, nullptr);
-    SendMessage(m_comboFps, CB_ADDSTRING, 0, (LPARAM)L"60 FPS");
-    SendMessage(m_comboFps, CB_ADDSTRING, 0, (LPARAM)L"90 FPS");
-    SendMessage(m_comboFps, CB_ADDSTRING, 0, (LPARAM)L"120 FPS");
-    SendMessage(m_comboFps, CB_ADDSTRING, 0, (LPARAM)L"144 FPS");
-    SendMessage(m_comboFps, CB_SETCURSEL, 0, 0);
+    m_comboFps = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 112, 284, 140, 200, m_hwnd, (HMENU)ID_COMBO_FPS, m_hInstance, nullptr);
     SendMessage(m_comboFps, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
     SetWindowTheme(m_comboFps, L"DarkMode_Explorer", nullptr);
 
@@ -269,6 +265,89 @@ void MainWindow::RefreshCaptureTargets() {
     if (!m_captureTargets.empty()) {
         SendMessage(m_comboTarget, CB_SETCURSEL, 0, 0);
     }
+
+    RefreshSupportedFps();
+}
+
+void MainWindow::RefreshSupportedFps() {
+    if (!m_comboFps) return;
+
+    // 1. 获取目标显示器的设备名与句柄
+    std::wstring deviceName;
+    HMONITOR hmon = nullptr;
+
+    int sel = (int)SendMessage(m_comboTarget, CB_GETCURSEL, 0, 0);
+    if (sel >= 0 && sel < (int)m_captureTargets.size()) {
+        const auto& target = m_captureTargets[sel];
+        if (target.type == CaptureTarget::Type::Monitor) {
+            hmon = target.hmon;
+        } else if (target.type == CaptureTarget::Type::Window && target.hwnd && IsWindow(target.hwnd)) {
+            hmon = MonitorFromWindow(target.hwnd, MONITOR_DEFAULTTONEAREST);
+        }
+    }
+
+    if (!hmon && m_hwnd) {
+        hmon = MonitorFromWindow(m_hwnd, MONITOR_DEFAULTTOPRIMARY);
+    }
+
+    if (hmon) {
+        MONITORINFOEXW mi = {};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(hmon, &mi)) {
+            deviceName = mi.szDevice;
+        }
+    }
+
+    const wchar_t* pDevName = !deviceName.empty() ? deviceName.c_str() : nullptr;
+
+    // 2. 通过系统 API 获取当前显示器的实际刷新率
+    DEVMODEW dmCurrent = {};
+    dmCurrent.dmSize = sizeof(dmCurrent);
+    int currentHz = 60;
+    if (EnumDisplaySettingsW(pDevName, ENUM_CURRENT_SETTINGS, &dmCurrent)) {
+        if (dmCurrent.dmDisplayFrequency > 0) {
+            currentHz = (int)dmCurrent.dmDisplayFrequency;
+            if (currentHz == 59) currentHz = 60;
+        }
+    }
+
+    // 3. 通过 EnumDisplaySettingsW 动态获取该显示器支持的所有模式刷新率
+    std::set<int> fpsSet;
+    DEVMODEW dmMode = {};
+    dmMode.dmSize = sizeof(dmMode);
+    for (DWORD i = 0; EnumDisplaySettingsW(pDevName, i, &dmMode); ++i) {
+        if (dmMode.dmDisplayFrequency > 0) {
+            int hz = (int)dmMode.dmDisplayFrequency;
+            if (hz == 59) hz = 60;
+            if (hz >= 24 && hz <= 360) {
+                fpsSet.insert(hz);
+            }
+        }
+    }
+
+    // 保底通用帧率与当前刷新率
+    fpsSet.insert(30);
+    fpsSet.insert(60);
+    if (currentHz > 0) {
+        fpsSet.insert(currentHz);
+    }
+
+    // 4. 填充下拉框并默认选中当前显示器刷新率
+    SendMessage(m_comboFps, CB_RESETCONTENT, 0, 0);
+    int defaultSel = 0;
+    int idx = 0;
+    for (int hz : fpsSet) {
+        std::wstring text = std::to_wstring(hz) + L" FPS";
+        if (hz == currentHz) {
+            text += L" (当前)";
+            defaultSel = idx;
+        }
+        LRESULT itemIdx = SendMessage(m_comboFps, CB_ADDSTRING, 0, (LPARAM)text.c_str());
+        SendMessage(m_comboFps, CB_SETITEMDATA, itemIdx, (LPARAM)hz);
+        idx++;
+    }
+
+    SendMessage(m_comboFps, CB_SETCURSEL, defaultSel, 0);
 }
 
 void MainWindow::RefreshDiscoveredDevices() {
@@ -431,8 +510,13 @@ bool MainWindow::StartSender() {
     int bitrateKbps = bitrates[bitrateIdx >= 0 && bitrateIdx < 4 ? bitrateIdx : 1];
 
     int fpsIdx = (int)SendMessage(m_comboFps, CB_GETCURSEL, 0, 0);
-    int fpsList[] = { 60, 90, 120, 144 };
-    int fps = fpsList[fpsIdx >= 0 && fpsIdx < 4 ? fpsIdx : 0];
+    int fps = 60;
+    if (fpsIdx != CB_ERR) {
+        LRESULT data = SendMessage(m_comboFps, CB_GETITEMDATA, fpsIdx, 0);
+        if (data != CB_ERR && data > 0) {
+            fps = (int)data;
+        }
+    }
 
     int protoIdx = (int)SendMessage(m_comboProtocol, CB_GETCURSEL, 0, 0);
     bool isUdp = (protoIdx == 0);
@@ -1200,6 +1284,8 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 pThis->UpdateStatusText();
             } else if (id == ID_BTN_REFRESH_TARGETS && code == BN_CLICKED) {
                 pThis->RefreshCaptureTargets();
+            } else if (id == ID_COMBO_TARGET && code == CBN_SELCHANGE) {
+                pThis->RefreshSupportedFps();
             } else if (id == ID_BTN_REFRESH_DEVICES && code == BN_CLICKED) {
                 if (pThis->m_lanDiscovery) {
                     pThis->m_lanDiscovery->Rescan();
