@@ -144,7 +144,11 @@ void TcpReceiver::HandleClient(SOCKET clientSock) {
             uint8_t statsBuf[8];
             if (RecvExact(clientSock, statsBuf, 8, m_isRunning)) {
                 m_receivedBytes.fetch_add(8);
-                // RTT and loss
+                int32_t rtt = (statsBuf[0] << 24) | (statsBuf[1] << 16) | (statsBuf[2] << 8) | statsBuf[3];
+                int32_t lossBp = (statsBuf[4] << 24) | (statsBuf[5] << 16) | (statsBuf[6] << 8) | statsBuf[7];
+                if (m_statsCallback) {
+                    m_statsCallback(rtt, lossBp);
+                }
             }
             continue;
         }

@@ -125,7 +125,7 @@ bool WmfAudioDecoder::Initialize(int sampleRate, int channels) {
 }
 
 bool WmfAudioDecoder::DecodeAac(const uint8_t* aacData, size_t bytes, int64_t timestampMs) {
-    if (!m_isInitialized || !m_decoder || !aacData || bytes == 0) return false;
+    if (!m_isInitialized || !m_decoder || !aacData || bytes <= 4) return false;
 
     Microsoft::WRL::ComPtr<IMFMediaBuffer> mediaBuffer;
     HRESULT hr = MFCreateMemoryBuffer(static_cast<DWORD>(bytes), &mediaBuffer);

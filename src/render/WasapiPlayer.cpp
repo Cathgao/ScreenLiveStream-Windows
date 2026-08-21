@@ -1,6 +1,16 @@
 #include "WasapiPlayer.h"
 #include "Logger.h"
 #include <avrt.h>
+#include <timeapi.h>
+#include <cmath>
+#include <algorithm>
+
+#ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+#define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM 0x80000000
+#endif
+#ifndef AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+#define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
+#endif
 
 WasapiPlayer::WasapiPlayer() {}
 
@@ -11,9 +21,12 @@ WasapiPlayer::~WasapiPlayer() {
 bool WasapiPlayer::Start(int sampleRate, int channels) {
     Stop();
 
-    m_sampleRate = sampleRate;
-    m_channels = channels;
-    m_isPlaying = true;
+    m_sampleRate = (sampleRate > 0) ? sampleRate : 48000;
+    m_channels = (channels > 0) ? channels : 2;
+    m_prebufferSamples = static_cast<size_t>((m_sampleRate * m_channels * 15) / 1000); // 15ms initial prebuffer
+    m_prebuffering = true;
+
+    m_isPlaying.store(true, std::memory_order_release);
     m_playThread = std::thread(&WasapiPlayer::PlayThreadProc, this);
     return true;
 }
@@ -27,28 +40,41 @@ void WasapiPlayer::Stop() {
     std::lock_guard<std::mutex> lock(m_queueMutex);
     m_pcmQueue.clear();
     m_queueReadOffset = 0;
+    m_prebuffering = true;
 }
 
-void WasapiPlayer::PushPcm(const uint8_t* pcmData, size_t bytes) {
-    if (!m_isPlaying || !pcmData || bytes == 0) return;
+void WasapiPlayer::SetAudioDelayMs(int delayMs) {
+    m_audioDelayMs.store(std::clamp(delayMs, -200, 500), std::memory_order_release);
+}
+
+void WasapiPlayer::PushPcm(const uint8_t* pcmData, size_t bytes, int64_t /*timestampMs*/) {
+    if (!m_isPlaying.load(std::memory_order_relaxed) || !pcmData || bytes < sizeof(int16_t)) return;
+
+    size_t sampleCount = bytes / sizeof(int16_t);
+    const int16_t* pSrc = reinterpret_cast<const int16_t*>(pcmData);
 
     std::lock_guard<std::mutex> lock(m_queueMutex);
-    size_t activeBytes = m_pcmQueue.size() - m_queueReadOffset;
-    size_t maxBytes = (m_sampleRate * m_channels * 2 * 200) / 1000;
-    if (activeBytes > maxBytes) {
-        m_queueReadOffset = m_pcmQueue.size() - maxBytes;
-    }
 
-    // Periodic compaction when offset exceeds 64KB
-    if (m_queueReadOffset > 65536) {
+    // Periodic compaction when offset exceeds 8K samples (~85ms)
+    if (m_queueReadOffset > 8192) {
         m_pcmQueue.erase(m_pcmQueue.begin(), m_pcmQueue.begin() + m_queueReadOffset);
         m_queueReadOffset = 0;
     }
-    m_pcmQueue.insert(m_pcmQueue.end(), pcmData, pcmData + bytes);
+
+    // Low-latency backlog cap (~75ms, approx 3.5 AAC frames) to keep live audio tightly synced with real-time video
+    size_t maxBacklog = static_cast<size_t>((m_sampleRate * m_channels * 75) / 1000);
+    size_t activeSamples = m_pcmQueue.size() - m_queueReadOffset;
+    if (activeSamples > maxBacklog) {
+        size_t targetActive = static_cast<size_t>((m_sampleRate * m_channels * 35) / 1000);
+        m_queueReadOffset = (m_pcmQueue.size() > targetActive) ? (m_pcmQueue.size() - targetActive) : 0;
+    }
+
+    m_pcmQueue.insert(m_pcmQueue.end(), pSrc, pSrc + sampleCount);
 }
 
 void WasapiPlayer::PlayThreadProc() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    timeBeginPeriod(1);
 
     DWORD taskIndex = 0;
     HANDLE hAvrt = AvSetMmThreadCharacteristicsA("Audio", &taskIndex);
@@ -63,6 +89,7 @@ void WasapiPlayer::PlayThreadProc() {
     );
 
     if (FAILED(hr)) {
+        timeEndPeriod(1);
         CoUninitialize();
         return;
     }
@@ -70,6 +97,7 @@ void WasapiPlayer::PlayThreadProc() {
     Microsoft::WRL::ComPtr<IMMDevice> device;
     hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
     if (FAILED(hr)) {
+        timeEndPeriod(1);
         CoUninitialize();
         return;
     }
@@ -77,51 +105,73 @@ void WasapiPlayer::PlayThreadProc() {
     Microsoft::WRL::ComPtr<IAudioClient> audioClient;
     hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&audioClient);
     if (FAILED(hr)) {
+        timeEndPeriod(1);
         CoUninitialize();
         return;
     }
 
+    // 1. Try Native WASAPI AutoConvertPCM (Windows 10/11 system resampler)
+    WAVEFORMATEX clientFmt = {};
+    clientFmt.wFormatTag = WAVE_FORMAT_PCM;
+    clientFmt.nChannels = static_cast<WORD>(m_channels);
+    clientFmt.nSamplesPerSec = static_cast<DWORD>(m_sampleRate);
+    clientFmt.wBitsPerSample = 16;
+    clientFmt.nBlockAlign = (clientFmt.nChannels * clientFmt.wBitsPerSample) / 8;
+    clientFmt.nAvgBytesPerSec = clientFmt.nSamplesPerSec * clientFmt.nBlockAlign;
+    clientFmt.cbSize = 0;
+
+    REFERENCE_TIME hnsBufferDuration = 200000; // 20ms low-latency hardware buffer
+    bool useNativeAutoConvert = false;
     WAVEFORMATEX* mixFormat = nullptr;
-    hr = audioClient->GetMixFormat(&mixFormat);
-    if (FAILED(hr) || !mixFormat) {
-        Logger::E("WasapiPlayer", "Failed to get mix format");
-        CoUninitialize();
-        return;
-    }
 
-    bool isFloat = false;
-    if (mixFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
-        isFloat = true;
-    } else if (mixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-        auto* ex = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mixFormat);
-        if (ex->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) {
-            isFloat = true;
-        }
-    }
-
-    int devChannels = mixFormat->nChannels;
-
-    REFERENCE_TIME hnsBufferDuration = 500000; // 50ms buffer
     hr = audioClient->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
-        0,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
         hnsBufferDuration,
         0,
-        mixFormat,
+        &clientFmt,
         nullptr
     );
 
-    if (FAILED(hr)) {
-        Logger::E("WasapiPlayer", "Failed to initialize audio renderer, hr = " + std::to_string(hr));
-        CoTaskMemFree(mixFormat);
-        CoUninitialize();
-        return;
+    if (SUCCEEDED(hr)) {
+        useNativeAutoConvert = true;
+        Logger::I("WasapiPlayer", "WASAPI initialized with native AutoConvertPCM (" + std::to_string(m_sampleRate) + " Hz, " + std::to_string(m_channels) + " ch)");
+    } else {
+        Logger::W("WasapiPlayer", "Native AutoConvertPCM initialize failed (hr = 0x" + std::to_string(hr) + "), using device MixFormat & software resampler fallback.");
+        hr = audioClient->GetMixFormat(&mixFormat);
+        if (FAILED(hr) || !mixFormat) {
+            Logger::E("WasapiPlayer", "Failed to get mix format");
+            timeEndPeriod(1);
+            if (hAvrt) AvRevertMmThreadCharacteristics(hAvrt);
+            CoUninitialize();
+            return;
+        }
+
+        hr = audioClient->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            0,
+            hnsBufferDuration,
+            0,
+            mixFormat,
+            nullptr
+        );
+
+        if (FAILED(hr)) {
+            Logger::E("WasapiPlayer", "Failed to initialize audio renderer with mixFormat, hr = 0x" + std::to_string(hr));
+            CoTaskMemFree(mixFormat);
+            timeEndPeriod(1);
+            if (hAvrt) AvRevertMmThreadCharacteristics(hAvrt);
+            CoUninitialize();
+            return;
+        }
     }
 
     UINT32 bufferFrameCount = 0;
     hr = audioClient->GetBufferSize(&bufferFrameCount);
     if (FAILED(hr)) {
-        CoTaskMemFree(mixFormat);
+        if (mixFormat) CoTaskMemFree(mixFormat);
+        timeEndPeriod(1);
+        if (hAvrt) AvRevertMmThreadCharacteristics(hAvrt);
         CoUninitialize();
         return;
     }
@@ -129,94 +179,201 @@ void WasapiPlayer::PlayThreadProc() {
     Microsoft::WRL::ComPtr<IAudioRenderClient> renderClient;
     hr = audioClient->GetService(__uuidof(IAudioRenderClient), (void**)&renderClient);
     if (FAILED(hr)) {
-        CoTaskMemFree(mixFormat);
+        if (mixFormat) CoTaskMemFree(mixFormat);
+        timeEndPeriod(1);
+        if (hAvrt) AvRevertMmThreadCharacteristics(hAvrt);
         CoUninitialize();
         return;
     }
 
     hr = audioClient->Start();
     if (FAILED(hr)) {
-        CoTaskMemFree(mixFormat);
+        if (mixFormat) CoTaskMemFree(mixFormat);
+        timeEndPeriod(1);
+        if (hAvrt) AvRevertMmThreadCharacteristics(hAvrt);
         CoUninitialize();
         return;
     }
 
-    Logger::I("WasapiPlayer", "Audio playback started (Device: " + std::to_string(mixFormat->nSamplesPerSec) + " Hz, " + std::to_string(devChannels) + " ch, float=" + std::to_string(isFloat) + ")");
+    int devSampleRate = m_sampleRate;
+    int devChannels = m_channels;
+    bool isFloat = false;
 
-    std::vector<int16_t> popBuffer;
+    if (!useNativeAutoConvert && mixFormat) {
+        devSampleRate = mixFormat->nSamplesPerSec;
+        devChannels = mixFormat->nChannels;
+        if (mixFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+            isFloat = true;
+        } else if (mixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+            auto* ex = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mixFormat);
+            if (ex->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) {
+                isFloat = true;
+            }
+        }
+        Logger::I("WasapiPlayer", "Audio playback fallback (Device: " + std::to_string(devSampleRate) + " Hz, " + std::to_string(devChannels) + " ch, float=" + std::to_string(isFloat) + ")");
+    }
 
-    while (m_isPlaying) {
+    std::vector<int16_t> tempInputPcm;
+    double softwareResamplePos = 0.0;
+
+    while (m_isPlaying.load(std::memory_order_relaxed)) {
         UINT32 numPaddingFrames = 0;
         hr = audioClient->GetCurrentPadding(&numPaddingFrames);
         if (SUCCEEDED(hr)) {
-            UINT32 numFramesAvailable = bufferFrameCount - numPaddingFrames;
+            UINT32 numFramesAvailable = (bufferFrameCount > numPaddingFrames) ? (bufferFrameCount - numPaddingFrames) : 0;
             if (numFramesAvailable > 0) {
                 BYTE* pData = nullptr;
                 hr = renderClient->GetBuffer(numFramesAvailable, &pData);
                 if (SUCCEEDED(hr) && pData) {
-                    size_t inBytesNeeded = numFramesAvailable * m_channels * sizeof(int16_t);
-                    bool hasData = false;
+                    if (useNativeAutoConvert) {
+                        size_t samplesNeeded = numFramesAvailable * m_channels;
+                        int16_t* pDst16 = reinterpret_cast<int16_t*>(pData);
 
-                    {
                         std::lock_guard<std::mutex> lock(m_queueMutex);
-                        size_t availableBytes = m_pcmQueue.size() - m_queueReadOffset;
-                        if (availableBytes >= inBytesNeeded) {
-                            const uint8_t* pSrc = m_pcmQueue.data() + m_queueReadOffset;
-                            popBuffer.assign(
-                                reinterpret_cast<const int16_t*>(pSrc),
-                                reinterpret_cast<const int16_t*>(pSrc) + (numFramesAvailable * m_channels)
-                            );
-                            m_queueReadOffset += inBytesNeeded;
-                            if (m_queueReadOffset == m_pcmQueue.size()) {
+                        size_t availableSamples = (m_pcmQueue.size() > m_queueReadOffset) ? (m_pcmQueue.size() - m_queueReadOffset) : 0;
+
+                        if (m_prebuffering) {
+                            if (availableSamples >= m_prebufferSamples) {
+                                m_prebuffering = false;
+                            } else {
+                                std::memset(pData, 0, samplesNeeded * sizeof(int16_t));
+                                renderClient->ReleaseBuffer(numFramesAvailable, 0);
+                                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                                continue;
+                            }
+                        }
+
+                        if (availableSamples >= samplesNeeded) {
+                            const int16_t* pSrc = m_pcmQueue.data() + m_queueReadOffset;
+                            std::memcpy(pDst16, pSrc, samplesNeeded * sizeof(int16_t));
+                            m_queueReadOffset += samplesNeeded;
+                            if (m_queueReadOffset >= m_pcmQueue.size()) {
                                 m_pcmQueue.clear();
                                 m_queueReadOffset = 0;
                             }
-                            hasData = true;
-                        }
-                    }
-
-                    if (hasData) {
-                        if (isFloat) {
-                            float* fDst = reinterpret_cast<float*>(pData);
-                            for (UINT32 i = 0; i < numFramesAvailable; ++i) {
-                                float left = popBuffer[i * m_channels + 0] / 32768.0f;
-                                float right = (m_channels > 1) ? popBuffer[i * m_channels + 1] / 32768.0f : left;
-
-                                fDst[i * devChannels + 0] = left;
-                                if (devChannels > 1) fDst[i * devChannels + 1] = right;
-                                for (int ch = 2; ch < devChannels; ++ch) {
-                                    fDst[i * devChannels + ch] = 0.0f;
-                                }
-                            }
+                            renderClient->ReleaseBuffer(numFramesAvailable, 0);
+                        } else if (availableSamples > 0) {
+                            // Partial read: copy available samples and zero-pad remainder to maintain smooth timing
+                            const int16_t* pSrc = m_pcmQueue.data() + m_queueReadOffset;
+                            std::memcpy(pDst16, pSrc, availableSamples * sizeof(int16_t));
+                            std::memset(pDst16 + availableSamples, 0, (samplesNeeded - availableSamples) * sizeof(int16_t));
+                            m_pcmQueue.clear();
+                            m_queueReadOffset = 0;
+                            renderClient->ReleaseBuffer(numFramesAvailable, 0);
                         } else {
-                            int16_t* sDst = reinterpret_cast<int16_t*>(pData);
-                            for (UINT32 i = 0; i < numFramesAvailable; ++i) {
-                                int16_t left = popBuffer[i * m_channels + 0];
-                                int16_t right = (m_channels > 1) ? popBuffer[i * m_channels + 1] : left;
+                            std::memset(pData, 0, samplesNeeded * sizeof(int16_t));
+                            renderClient->ReleaseBuffer(numFramesAvailable, AUDCLNT_BUFFERFLAGS_SILENT);
+                        }
+                    } else {
+                        // Software Resampling Fallback
+                        double ratio = static_cast<double>(m_sampleRate) / static_cast<double>(devSampleRate);
+                        double totalInFramesNeeded = numFramesAvailable * ratio + 2.0;
+                        size_t inFramesToFetch = static_cast<size_t>(std::ceil(totalInFramesNeeded));
+                        size_t inSamplesToFetch = inFramesToFetch * m_channels;
 
-                                sDst[i * devChannels + 0] = left;
-                                if (devChannels > 1) sDst[i * devChannels + 1] = right;
-                                for (int ch = 2; ch < devChannels; ++ch) {
-                                    sDst[i * devChannels + ch] = 0;
+                        size_t availableSamples = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(m_queueMutex);
+                            availableSamples = (m_pcmQueue.size() > m_queueReadOffset) ? (m_pcmQueue.size() - m_queueReadOffset) : 0;
+
+                            if (m_prebuffering) {
+                                if (availableSamples >= m_prebufferSamples) {
+                                    m_prebuffering = false;
+                                } else {
+                                    renderClient->ReleaseBuffer(numFramesAvailable, AUDCLNT_BUFFERFLAGS_SILENT);
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                                    continue;
                                 }
                             }
+
+                            size_t copySamples = std::min(availableSamples, inSamplesToFetch);
+                            if (copySamples > 0) {
+                                const int16_t* pSrc = m_pcmQueue.data() + m_queueReadOffset;
+                                tempInputPcm.assign(pSrc, pSrc + copySamples);
+                            } else {
+                                tempInputPcm.clear();
+                            }
                         }
-                        renderClient->ReleaseBuffer(numFramesAvailable, 0);
-                    } else {
-                        // Underflow: write silence
-                        renderClient->ReleaseBuffer(numFramesAvailable, AUDCLNT_BUFFERFLAGS_SILENT);
+
+                        size_t inFramesAvailable = tempInputPcm.size() / m_channels;
+
+                        if (inFramesAvailable >= 2) {
+                            if (isFloat) {
+                                float* fDst = reinterpret_cast<float*>(pData);
+                                for (UINT32 i = 0; i < numFramesAvailable; ++i) {
+                                    double pos = softwareResamplePos + i * ratio;
+                                    size_t idx = static_cast<size_t>(pos);
+                                    double frac = pos - idx;
+
+                                    if (idx + 1 < inFramesAvailable) {
+                                        float left = static_cast<float>((1.0 - frac) * tempInputPcm[idx * m_channels + 0] + frac * tempInputPcm[(idx + 1) * m_channels + 0]) / 32768.0f;
+                                        float right = (m_channels > 1) ?
+                                            static_cast<float>((1.0 - frac) * tempInputPcm[idx * m_channels + 1] + frac * tempInputPcm[(idx + 1) * m_channels + 1]) / 32768.0f : left;
+
+                                        fDst[i * devChannels + 0] = left;
+                                        if (devChannels > 1) fDst[i * devChannels + 1] = right;
+                                        for (int ch = 2; ch < devChannels; ++ch) fDst[i * devChannels + ch] = 0.0f;
+                                    } else {
+                                        for (int ch = 0; ch < devChannels; ++ch) fDst[i * devChannels + ch] = 0.0f;
+                                    }
+                                }
+                            } else {
+                                int16_t* sDst = reinterpret_cast<int16_t*>(pData);
+                                for (UINT32 i = 0; i < numFramesAvailable; ++i) {
+                                    double pos = softwareResamplePos + i * ratio;
+                                    size_t idx = static_cast<size_t>(pos);
+                                    double frac = pos - idx;
+
+                                    if (idx + 1 < inFramesAvailable) {
+                                        int16_t left = static_cast<int16_t>(std::clamp((1.0 - frac) * tempInputPcm[idx * m_channels + 0] + frac * tempInputPcm[(idx + 1) * m_channels + 0], -32768.0, 32767.0));
+                                        int16_t right = (m_channels > 1) ?
+                                            static_cast<int16_t>(std::clamp((1.0 - frac) * tempInputPcm[idx * m_channels + 1] + frac * tempInputPcm[(idx + 1) * m_channels + 1], -32768.0, 32767.0)) : left;
+
+                                        sDst[i * devChannels + 0] = left;
+                                        if (devChannels > 1) sDst[i * devChannels + 1] = right;
+                                        for (int ch = 2; ch < devChannels; ++ch) sDst[i * devChannels + ch] = 0;
+                                    } else {
+                                        for (int ch = 0; ch < devChannels; ++ch) sDst[i * devChannels + ch] = 0;
+                                    }
+                                }
+                            }
+
+                            double finalPos = softwareResamplePos + numFramesAvailable * ratio;
+                            size_t consumedInFrames = static_cast<size_t>(finalPos);
+                            softwareResamplePos = finalPos - consumedInFrames;
+
+                            {
+                                std::lock_guard<std::mutex> lock(m_queueMutex);
+                                size_t consumedSamples = std::min(consumedInFrames * m_channels, m_pcmQueue.size() - m_queueReadOffset);
+                                m_queueReadOffset += consumedSamples;
+                                if (m_queueReadOffset >= m_pcmQueue.size()) {
+                                    m_pcmQueue.clear();
+                                    m_queueReadOffset = 0;
+                                }
+                            }
+                            renderClient->ReleaseBuffer(numFramesAvailable, 0);
+                        } else {
+                            softwareResamplePos = 0.0;
+                            renderClient->ReleaseBuffer(numFramesAvailable, AUDCLNT_BUFFERFLAGS_SILENT);
+                        }
                     }
                 }
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
     audioClient->Stop();
-    CoTaskMemFree(mixFormat);
+    if (mixFormat) {
+        CoTaskMemFree(mixFormat);
+    }
 
     if (hAvrt) {
         AvRevertMmThreadCharacteristics(hAvrt);
     }
+    timeEndPeriod(1);
     CoUninitialize();
 }
+
+
+

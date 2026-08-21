@@ -854,9 +854,9 @@ bool MainWindow::StartReceiver() {
 
     m_audioDecoder = std::make_unique<WmfAudioDecoder>();
     m_audioDecoder->Initialize(48000, 2);
-    m_audioDecoder->SetDecodedCallback([this](const uint8_t* pcm, size_t bytes, int64_t) {
+    m_audioDecoder->SetDecodedCallback([this](const uint8_t* pcm, size_t bytes, int64_t ts) {
         if (m_wasapiPlayer && m_wasapiPlayer->IsPlaying()) {
-            m_wasapiPlayer->PushPcm(pcm, bytes);
+            m_wasapiPlayer->PushPcm(pcm, bytes, ts);
         }
     });
 
@@ -867,10 +867,15 @@ bool MainWindow::StartReceiver() {
     m_statRttMs = 0;
     m_videoDecoder = std::make_unique<FfmpegVideoDecoder>(m_d3dResources.device.Get());
     m_videoDecoder->Initialize(VideoCodecType::H265_HEVC);
-    m_videoDecoder->SetDecodedCallback([this](ID3D11Texture2D* tex, int64_t, int w, int h) {
+    m_videoDecoder->SetDecodedCallback([this](ID3D11Texture2D* tex, int64_t ts, int w, int h) {
         m_statWidth = w;
         m_statHeight = h;
         m_fpsCounter.fetch_add(1);
+
+        if (ts >= 0) {
+            m_currentVideoPtsMs.store(ts, std::memory_order_relaxed);
+            m_currentVideoPtsLocalTimeMs.store(Protocol::GetCurrentMillis(), std::memory_order_relaxed);
+        }
 
         if (m_hwnd && (m_postedAdaptW.load() != w || m_postedAdaptH.load() != h)) {
             m_postedAdaptW = w;
@@ -945,6 +950,10 @@ bool MainWindow::StartReceiver() {
                 m_audioDecoder->DecodeAac(data, size, ts);
             }
         });
+        m_tcpReceiver->SetStatsCallback([this](int rtt, int loss) {
+            m_statRttMs = rtt;
+            m_statLossBps = loss;
+        });
         m_tcpReceiver->Start(port);
     }
 
@@ -955,6 +964,13 @@ bool MainWindow::StartReceiver() {
     UpdateUiMode();
     UpdateStatusText();
     return true;
+}
+
+int64_t MainWindow::GetCurrentRenderedVideoPtsMs() const {
+    int64_t basePts = m_currentVideoPtsMs.load(std::memory_order_relaxed);
+    if (basePts < 0) return -1;
+    int64_t elapsed = Protocol::GetCurrentMillis() - m_currentVideoPtsLocalTimeMs.load(std::memory_order_relaxed);
+    return basePts + elapsed;
 }
 
 void MainWindow::StopReceiver() {
@@ -1431,7 +1447,6 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     } else if (pThis->m_tcpReceiver) {
                         uint64_t bytes = pThis->m_tcpReceiver->GetAndResetReceivedBytes();
                         pThis->m_statBitrateKbps = static_cast<int>((bytes * 8) / 1000);
-                        pThis->m_statRttMs = 0;
                     }
                     pThis->m_statFps = pThis->m_fpsCounter.exchange(0);
                     pThis->UpdateStatusText();
@@ -1472,6 +1487,31 @@ LRESULT CALLBACK MainWindow::ReceiverWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 int w = LOWORD(lParam);
                 int h = HIWORD(lParam);
                 pThis->m_d3dRenderer->Resize(w, h);
+            }
+            break;
+        }
+
+        case WM_KEYDOWN: {
+            if (pThis && pThis->m_wasapiPlayer) {
+                int cur = pThis->m_wasapiPlayer->GetAudioDelayMs();
+                int delta = 0;
+                if (wParam == VK_OEM_4 || wParam == VK_LEFT || wParam == VK_SUBTRACT || wParam == VK_OEM_MINUS) { // [ or Left or -
+                    delta = -10;
+                } else if (wParam == VK_OEM_6 || wParam == VK_RIGHT || wParam == VK_ADD || wParam == VK_OEM_PLUS) { // ] or Right or +
+                    delta = +10;
+                } else if (wParam == '0') {
+                    pThis->m_wasapiPlayer->SetAudioDelayMs(0);
+                    std::wstring title = L"Live Stream Receiver - 音画同步偏移: 0 ms";
+                    SetWindowTextW(hwnd, title.c_str());
+                    break;
+                }
+
+                if (delta != 0) {
+                    int nextVal = std::clamp(cur + delta, -200, 500);
+                    pThis->m_wasapiPlayer->SetAudioDelayMs(nextVal);
+                    std::wstring title = L"Live Stream Receiver - 音画同步偏移: " + (nextVal >= 0 ? std::wstring(L"+") : std::wstring()) + std::to_wstring(nextVal) + L" ms (快捷键 [ / ] 调节, 0 复位)";
+                    SetWindowTextW(hwnd, title.c_str());
+                }
             }
             break;
         }

@@ -102,6 +102,11 @@ private:
     int m_appliedAdaptedW = 0;
     int m_appliedAdaptedH = 0;
 
+    // Presentation Timestamp (PTS) Tracking for AV Sync
+    std::atomic<int64_t> m_currentVideoPtsMs{ -1 };
+    std::atomic<int64_t> m_currentVideoPtsLocalTimeMs{ 0 };
+    int64_t GetCurrentRenderedVideoPtsMs() const;
+
     // UI Control Handles
     HWND m_btnModeSender = nullptr;
     HWND m_btnModeReceiver = nullptr;

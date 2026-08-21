@@ -113,6 +113,7 @@ target_link_libraries(ScreenLiveStreamWindows PRIVATE
     dwmapi
     uxtheme
     gdiplus
+    winmm
 )
 
 set_target_properties(ScreenLiveStreamWindows PROPERTIES

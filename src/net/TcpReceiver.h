@@ -14,6 +14,7 @@ class TcpReceiver {
 public:
     using VideoFrameCallback = std::function<void(const uint8_t* data, size_t size, int64_t timestampMs, bool isKeyframe, bool isCodecConfig, bool isHevc)>;
     using AudioFrameCallback = std::function<void(const uint8_t* data, size_t size, int64_t timestampMs)>;
+    using StatsCallback = std::function<void(int rttMs, int lossBasisPoints)>;
 
     TcpReceiver();
     ~TcpReceiver();
@@ -24,6 +25,7 @@ public:
 
     void SetVideoCallback(VideoFrameCallback cb) { m_videoCallback = cb; }
     void SetAudioCallback(AudioFrameCallback cb) { m_audioCallback = cb; }
+    void SetStatsCallback(StatsCallback cb) { m_statsCallback = cb; }
 
     uint64_t GetAndResetReceivedBytes() {
         return m_receivedBytes.exchange(0);
@@ -39,6 +41,7 @@ private:
 
     VideoFrameCallback m_videoCallback;
     AudioFrameCallback m_audioCallback;
+    StatsCallback m_statsCallback;
 
     void ListenThreadProc();
     void HandleClient(SOCKET clientSock);
