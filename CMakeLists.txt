@@ -14,8 +14,18 @@ add_compile_definitions(
 
 if(MSVC)
     add_compile_options(/W4 /utf-8 /permissive- /Zc:__cplusplus /EHsc)
-    add_compile_options(/await:strict)
+    add_compile_options(/await:strict /MP)
 endif()
+
+# ======================== 激进性能与链接时优化 (LTO / LTCG) ========================
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+if(ipo_supported)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    message(STATUS "[Optimize] Link-Time Code Generation (LTO / LTCG) Enabled for Release")
+endif()
+
+# =================================================================================
 
 set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffmpeg")
 
@@ -104,9 +114,42 @@ set_target_properties(ScreenLiveStreamWindows PROPERTIES
     WIN32_EXECUTABLE TRUE
 )
 
+if(MSVC)
+    # 宏定义与 SSE4.2 支持声明
+    target_compile_definitions(ScreenLiveStreamWindows PRIVATE
+        __SSE4_2__=1
+    )
+
+    # Release 模式激进优化选项
+    target_compile_options(ScreenLiveStreamWindows PRIVATE
+        $<$<CONFIG:Release>:
+            /O2             # 最大速度
+            /Ob3            # 极度激进内联 (VS2019+)
+            /Oi             # 启用内置内部函数 (Intrinsic functions)
+            /Ot             # 偏向代码执行速度
+            /Oy             # 省略帧指针 (释放通用寄存器)
+            /fp:fast        # 快速浮点计算 (放宽 IEEE 754，允许向量化重排)
+            /Gw             # 全局数据优化
+            /Gy             # 函数级链接 (支持死代码消除)
+            /GF             # 字符串池优化
+            /Zc:inline      # 剔除未引用的内联函数
+            /GS-            # 关闭栈安全检查 (消除高频函数调用压栈/检查开销)
+        >
+    )
+
+    # Release 模式链接器激进优化
+    target_link_options(ScreenLiveStreamWindows PRIVATE
+        $<$<CONFIG:Release>:
+            /OPT:REF        # 剔除未引用的函数和数据 (Dead-code elimination)
+            /OPT:ICF        # 折叠完全相同的代码段 (Identical COMDAT Folding)
+        >
+    )
+endif()
+
 # Copy FFmpeg DLLs to output directory
 add_custom_command(TARGET ScreenLiveStreamWindows POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${FFMPEG_DIR}/bin"
     "$<TARGET_FILE_DIR:ScreenLiveStreamWindows>"
 )
+
