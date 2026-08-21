@@ -6,6 +6,11 @@ on:
       - 'v*'
       - '[0-9]+.[0-9]+.[0-9]+*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag Name (e.g. v1.0.1, leave blank for nightly)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -53,14 +58,25 @@ jobs:
           # Copy FFmpeg and runtime DLLs
           Copy-Item "build\*.dll" -Destination $ReleaseDir\
           
-          # Determine Tag/Release Name
-          $Tag = "${{ github.ref_name }}"
-          if ([string]::IsNullOrWhiteSpace($Tag)) { $Tag = "nightly" }
+          # Determine Tag/Release Name safely (never use branch name 'main' as tag)
+          $EventName = "${{ github.event_name }}"
+          $InputTag = "${{ inputs.tag_name }}"
+          $RefName = "${{ github.ref_name }}"
+          
+          if ($EventName -eq "workflow_dispatch") {
+              if (-not [string]::IsNullOrWhiteSpace($InputTag)) {
+                  $Tag = $InputTag
+              } else {
+                  $Tag = "nightly"
+              }
+          } else {
+              $Tag = $RefName
+          }
           
           $ZipName = "ScreenLiveStream-Windows-$Tag-x64.zip"
           Compress-Archive -Path "$ReleaseDir\*" -DestinationPath $ZipName -Force
           
-          Write-Host "Created release package: $ZipName"
+          Write-Host "Created release package: $ZipName for tag: $Tag"
           echo "ZIP_NAME=$ZipName" >> $env:GITHUB_ENV
           echo "TAG_NAME=$Tag" >> $env:GITHUB_ENV
 
