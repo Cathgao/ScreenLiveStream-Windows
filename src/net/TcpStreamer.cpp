@@ -78,7 +78,7 @@ void TcpStreamer::SendFrame(
 
     uint8_t flags = 0;
     if (isKeyframe) flags |= 0x01;
-    if (isCodecConfig && !isKeyframe) flags |= 0x02;
+    if (isCodecConfig) flags |= 0x02;
     if (isHevc) flags |= 0x04;
     if (isAudio) flags |= 0x08;
 

@@ -21,7 +21,6 @@ void WmfAudioEncoder::Shutdown() {
         m_encoder->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
         m_encoder = nullptr;
     }
-    m_encodedCallback = nullptr;
 }
 
 bool WmfAudioEncoder::Initialize(int sampleRate, int channels, int bitrateBps) {
@@ -151,28 +150,56 @@ void WmfAudioEncoder::DrainOutput(int64_t timestampMs) {
     MFT_OUTPUT_STREAM_INFO streamInfo = {};
     m_encoder->GetOutputStreamInfo(0, &streamInfo);
 
+    bool providesSamples = (streamInfo.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
+
     while (true) {
         Microsoft::WRL::ComPtr<IMFSample> outSample;
         Microsoft::WRL::ComPtr<IMFMediaBuffer> outMediaBuffer;
 
-        if ((streamInfo.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) == 0) {
+        if (!providesSamples) {
             MFCreateSample(&outSample);
             MFCreateMemoryBuffer(streamInfo.cbSize > 0 ? streamInfo.cbSize : 4096, &outMediaBuffer);
             outSample->AddBuffer(outMediaBuffer.Get());
             outputBuffer.pSample = outSample.Get();
+        } else {
+            outputBuffer.pSample = nullptr;
         }
 
         DWORD status = 0;
         HRESULT hr = m_encoder->ProcessOutput(0, 1, &outputBuffer, &status);
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            if (outputBuffer.pEvents) {
+                outputBuffer.pEvents->Release();
+                outputBuffer.pEvents = nullptr;
+            }
             break;
         }
         if (FAILED(hr)) {
+            if (outputBuffer.pEvents) {
+                outputBuffer.pEvents->Release();
+                outputBuffer.pEvents = nullptr;
+            }
+            if (outputBuffer.pSample && providesSamples) {
+                outputBuffer.pSample->Release();
+                outputBuffer.pSample = nullptr;
+            }
             break;
         }
 
         IMFSample* pSample = outputBuffer.pSample;
-        if (!pSample) break;
+        if (!pSample) {
+            if (outputBuffer.pEvents) {
+                outputBuffer.pEvents->Release();
+                outputBuffer.pEvents = nullptr;
+            }
+            break;
+        }
+
+        LONGLONG sampleTimeHns = 0;
+        int64_t ptsMs = timestampMs;
+        if (SUCCEEDED(pSample->GetSampleTime(&sampleTimeHns))) {
+            ptsMs = sampleTimeHns / 10000;
+        }
 
         Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
         if (SUCCEEDED(pSample->ConvertToContiguousBuffer(&buffer)) && buffer) {
@@ -180,7 +207,7 @@ void WmfAudioEncoder::DrainOutput(int64_t timestampMs) {
             DWORD maxLen = 0, currentLen = 0;
             if (SUCCEEDED(buffer->Lock(&pData, &maxLen, &currentLen)) && pData && currentLen > 0) {
                 if (m_encodedCallback) {
-                    m_encodedCallback(pData, currentLen, timestampMs);
+                    m_encodedCallback(pData, currentLen, ptsMs);
                 }
                 buffer->Unlock();
             }
@@ -189,6 +216,11 @@ void WmfAudioEncoder::DrainOutput(int64_t timestampMs) {
         if (outputBuffer.pEvents) {
             outputBuffer.pEvents->Release();
             outputBuffer.pEvents = nullptr;
+        }
+
+        if (providesSamples && outputBuffer.pSample) {
+            outputBuffer.pSample->Release();
+            outputBuffer.pSample = nullptr;
         }
     }
 }

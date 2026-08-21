@@ -31,8 +31,8 @@ private:
     std::thread m_captureThread;
     AudioCallback m_audioCallback;
 
-    int m_sampleRate = 48000;
-    int m_channels = 2;
+    std::atomic<int> m_sampleRate{ 48000 };
+    std::atomic<int> m_channels{ 2 };
 
     void CaptureThreadProc();
 };

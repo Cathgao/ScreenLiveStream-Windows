@@ -99,13 +99,16 @@ void UdpStreamer::SendFrame(
     uint32_t currentSeq = isAudio ? (++m_audioSeq) : (++m_videoSeq);
 
     if (isAudio) {
+        uint8_t audioFlags = 0x10; // FLAG_AUDIO
+        if (isCodecConfig) audioFlags |= 0x20; // FLAG_CODEC_CONFIG
+
         // Single packet for audio frame (stack buffer up to 1500 bytes, fallback vector if unusually large)
         if (28 + size <= 1500) {
             uint8_t packet[1500];
             packet[0] = 'U'; packet[1] = 'D'; packet[2] = 'P'; packet[3] = 'V';
             WriteBigEndian32(&packet[4], currentSeq);
             WriteBigEndian64(&packet[8], static_cast<uint64_t>(timestampMs));
-            packet[16] = 0x10; // FLAG_AUDIO
+            packet[16] = audioFlags;
             WriteBigEndian16(&packet[17], 0); // fragIndex = 0
             WriteBigEndian16(&packet[19], 1); // totalFragments = 1
             WriteBigEndian32(&packet[21], static_cast<uint32_t>(size));
@@ -119,7 +122,7 @@ void UdpStreamer::SendFrame(
             packet[0] = 'U'; packet[1] = 'D'; packet[2] = 'P'; packet[3] = 'V';
             WriteBigEndian32(&packet[4], currentSeq);
             WriteBigEndian64(&packet[8], static_cast<uint64_t>(timestampMs));
-            packet[16] = 0x10; // FLAG_AUDIO
+            packet[16] = audioFlags;
             WriteBigEndian16(&packet[17], 0);
             WriteBigEndian16(&packet[19], 1);
             WriteBigEndian32(&packet[21], static_cast<uint32_t>(size));

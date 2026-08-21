@@ -1,10 +1,42 @@
 #include "WasapiCapture.h"
 #include "Logger.h"
 #include "Protocol.h"
+#include <wrl/implements.h>
 #include <avrt.h>
 #include <timeapi.h>
 #include <algorithm>
 #include <cmath>
+
+namespace {
+
+class AudioEndpointNotifier : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+    IMMNotificationClient>
+{
+public:
+    AudioEndpointNotifier(std::atomic<bool>& deviceChanged) : m_deviceChanged(deviceChanged) {}
+
+    STDMETHODIMP OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR /*pwstrDeviceId*/) override {
+        if (flow == eRender && (role == eMultimedia || role == eConsole)) {
+            m_deviceChanged.store(true, std::memory_order_release);
+        }
+        return S_OK;
+    }
+
+    STDMETHODIMP OnDeviceStateChanged(LPCWSTR /*pwstrDeviceId*/, DWORD /*dwNewState*/) override {
+        m_deviceChanged.store(true, std::memory_order_release);
+        return S_OK;
+    }
+
+    STDMETHODIMP OnDeviceAdded(LPCWSTR /*pwstrDeviceId*/) override { return S_OK; }
+    STDMETHODIMP OnDeviceRemoved(LPCWSTR /*pwstrDeviceId*/) override { return S_OK; }
+    STDMETHODIMP OnPropertyValueChanged(LPCWSTR /*pwstrDeviceId*/, const PROPERTYKEY /*key*/) override { return S_OK; }
+
+private:
+    std::atomic<bool>& m_deviceChanged;
+};
+
+} // namespace
 
 WasapiCapture::WasapiCapture() {}
 
@@ -26,7 +58,6 @@ void WasapiCapture::Stop() {
             m_captureThread.join();
         }
     }
-    m_audioCallback = nullptr;
 }
 
 void WasapiCapture::CaptureThreadProc() {
@@ -45,91 +76,111 @@ void WasapiCapture::CaptureThreadProc() {
         (void**)&enumerator
     );
 
-    if (FAILED(hr)) {
+    if (FAILED(hr) || !enumerator) {
         Logger::E("WASAPI", "Failed to create MMDeviceEnumerator");
         timeEndPeriod(1);
+        if (hAvrt) AvRevertMmThreadCharacteristics(hAvrt);
         CoUninitialize();
         return;
     }
+
+    std::atomic<bool> deviceChanged{ false };
+    auto notifier = Microsoft::WRL::Make<AudioEndpointNotifier>(deviceChanged);
+    enumerator->RegisterEndpointNotificationCallback(notifier.Get());
+
+    auto initLoopback = [&](
+        Microsoft::WRL::ComPtr<IMMDevice>& outDevice,
+        Microsoft::WRL::ComPtr<IAudioClient>& outClient,
+        Microsoft::WRL::ComPtr<IAudioCaptureClient>& outCapture,
+        WAVEFORMATEX*& outFormat,
+        bool& outIsFloat
+    ) -> bool {
+        if (outClient) {
+            outClient->Stop();
+            outClient = nullptr;
+        }
+        outCapture = nullptr;
+        outDevice = nullptr;
+        if (outFormat) {
+            CoTaskMemFree(outFormat);
+            outFormat = nullptr;
+        }
+
+        HRESULT localHr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &outDevice);
+        if (FAILED(localHr) || !outDevice) {
+            return false;
+        }
+
+        localHr = outDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&outClient);
+        if (FAILED(localHr) || !outClient) {
+            return false;
+        }
+
+        localHr = outClient->GetMixFormat(&outFormat);
+        if (FAILED(localHr) || !outFormat) {
+            return false;
+        }
+
+        m_sampleRate.store(outFormat->nSamplesPerSec, std::memory_order_relaxed);
+        m_channels.store(outFormat->nChannels, std::memory_order_relaxed);
+
+        outIsFloat = false;
+        if (outFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+            outIsFloat = true;
+        } else if (outFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+            auto* ex = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(outFormat);
+            if (ex->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) {
+                outIsFloat = true;
+            }
+        }
+
+        REFERENCE_TIME hnsBufferDuration = 500000; // 50ms buffer
+        localHr = outClient->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK,
+            hnsBufferDuration,
+            0,
+            outFormat,
+            nullptr
+        );
+        if (FAILED(localHr)) {
+            CoTaskMemFree(outFormat);
+            outFormat = nullptr;
+            outClient = nullptr;
+            return false;
+        }
+
+        localHr = outClient->GetService(__uuidof(IAudioCaptureClient), (void**)&outCapture);
+        if (FAILED(localHr) || !outCapture) {
+            CoTaskMemFree(outFormat);
+            outFormat = nullptr;
+            outClient = nullptr;
+            return false;
+        }
+
+        localHr = outClient->Start();
+        if (FAILED(localHr)) {
+            CoTaskMemFree(outFormat);
+            outFormat = nullptr;
+            outCapture = nullptr;
+            outClient = nullptr;
+            return false;
+        }
+
+        Logger::I("WASAPI", "Loopback capture initialized: " +
+                  std::to_string(m_sampleRate.load()) + " Hz, " +
+                  std::to_string(m_channels.load()) + " ch, float=" +
+                  std::to_string(outIsFloat) + " -> Target 48000Hz Stereo");
+        return true;
+    };
 
     Microsoft::WRL::ComPtr<IMMDevice> device;
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
-    if (FAILED(hr)) {
-        Logger::E("WASAPI", "Failed to get default audio endpoint");
-        timeEndPeriod(1);
-        CoUninitialize();
-        return;
-    }
-
     Microsoft::WRL::ComPtr<IAudioClient> audioClient;
-    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&audioClient);
-    if (FAILED(hr)) {
-        Logger::E("WASAPI", "Failed to activate IAudioClient");
-        timeEndPeriod(1);
-        CoUninitialize();
-        return;
-    }
-
-    WAVEFORMATEX* mixFormat = nullptr;
-    hr = audioClient->GetMixFormat(&mixFormat);
-    if (FAILED(hr) || !mixFormat) {
-        Logger::E("WASAPI", "Failed to get mix format");
-        timeEndPeriod(1);
-        CoUninitialize();
-        return;
-    }
-
-    m_sampleRate = mixFormat->nSamplesPerSec;
-    m_channels = mixFormat->nChannels;
-
-    bool isFloat = false;
-    if (mixFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
-        isFloat = true;
-    } else if (mixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-        auto* ex = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mixFormat);
-        if (ex->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) {
-            isFloat = true;
-        }
-    }
-
-    REFERENCE_TIME hnsBufferDuration = 500000; // 50ms buffer
-    hr = audioClient->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK,
-        hnsBufferDuration,
-        0,
-        mixFormat,
-        nullptr
-    );
-
-    if (FAILED(hr)) {
-        Logger::E("WASAPI", "Failed to initialize audio client for loopback");
-        CoTaskMemFree(mixFormat);
-        timeEndPeriod(1);
-        CoUninitialize();
-        return;
-    }
-
     Microsoft::WRL::ComPtr<IAudioCaptureClient> captureClient;
-    hr = audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&captureClient);
-    if (FAILED(hr)) {
-        Logger::E("WASAPI", "Failed to get IAudioCaptureClient");
-        CoTaskMemFree(mixFormat);
-        timeEndPeriod(1);
-        CoUninitialize();
-        return;
-    }
+    WAVEFORMATEX* mixFormat = nullptr;
+    bool isFloat = false;
 
-    hr = audioClient->Start();
-    if (FAILED(hr)) {
-        Logger::E("WASAPI", "Failed to start audio client");
-        CoTaskMemFree(mixFormat);
-        timeEndPeriod(1);
-        CoUninitialize();
-        return;
-    }
-
-    Logger::I("WASAPI", "Loopback capture started: " + std::to_string(m_sampleRate) + " Hz, " + std::to_string(m_channels) + " channels, float=" + std::to_string(isFloat) + " -> Target 48000Hz Stereo");
+    bool clientReady = initLoopback(device, audioClient, captureClient, mixFormat, isFloat);
 
     std::vector<int16_t> pcm16Buffer;
     std::vector<float> inFloatL;
@@ -138,10 +189,47 @@ void WasapiCapture::CaptureThreadProc() {
     auto lastPacketTime = std::chrono::steady_clock::now();
 
     while (m_isCapturing) {
+        bool needsReinit = deviceChanged.exchange(false);
+
+        if (!clientReady || needsReinit) {
+            if (needsReinit) {
+                Logger::I("WASAPI", "Default audio device change detected. Re-initializing loopback capture...");
+            }
+            clientReady = initLoopback(device, audioClient, captureClient, mixFormat, isFloat);
+            if (clientReady) {
+                captureResamplePos = 0.0;
+                lastPacketTime = std::chrono::steady_clock::now();
+            } else {
+                // If device switch is in transition, inject keep-alive silence
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPacketTime).count() >= 20) {
+                    lastPacketTime = now;
+                    pcm16Buffer.assign(960 * 2, 0);
+                    int64_t timestampNs = Protocol::GetCurrentNanos();
+                    if (m_audioCallback) {
+                        m_audioCallback(reinterpret_cast<const uint8_t*>(pcm16Buffer.data()), pcm16Buffer.size() * sizeof(int16_t), timestampNs);
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
+        }
+
         UINT32 packetLength = 0;
         hr = captureClient->GetNextPacketSize(&packetLength);
 
-        if (SUCCEEDED(hr) && packetLength > 0) {
+        if (hr == AUDCLNT_E_DEVICE_INVALIDATED ||
+            hr == AUDCLNT_E_RESOURCES_INVALIDATED ||
+            hr == AUDCLNT_E_SERVICE_NOT_RUNNING ||
+            FAILED(hr))
+        {
+            Logger::W("WASAPI", "Audio device invalidated or error (hr = 0x" + std::to_string(hr) + "). Triggering re-initialization...");
+            clientReady = false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        if (packetLength > 0) {
             BYTE* pData = nullptr;
             UINT32 numFramesRead = 0;
             DWORD flags = 0;
@@ -149,9 +237,18 @@ void WasapiCapture::CaptureThreadProc() {
             UINT64 qpcPos = 0;
 
             hr = captureClient->GetBuffer(&pData, &numFramesRead, &flags, &devPos, &qpcPos);
+            if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_RESOURCES_INVALIDATED) {
+                Logger::W("WASAPI", "GetBuffer device invalidated. Triggering re-initialization...");
+                clientReady = false;
+                continue;
+            }
+
             if (SUCCEEDED(hr) && numFramesRead > 0) {
                 lastPacketTime = std::chrono::steady_clock::now();
                 int64_t timestampNs = Protocol::GetCurrentNanos();
+
+                int curSampleRate = m_sampleRate.load(std::memory_order_relaxed);
+                int curChannels = m_channels.load(std::memory_order_relaxed);
 
                 inFloatL.resize(numFramesRead);
                 inFloatR.resize(numFramesRead);
@@ -162,18 +259,18 @@ void WasapiCapture::CaptureThreadProc() {
                 } else if (isFloat) {
                     const float* fData = reinterpret_cast<const float*>(pData);
                     for (UINT32 i = 0; i < numFramesRead; ++i) {
-                        inFloatL[i] = fData[i * m_channels + 0];
-                        inFloatR[i] = (m_channels > 1) ? fData[i * m_channels + 1] : inFloatL[i];
+                        inFloatL[i] = fData[i * curChannels + 0];
+                        inFloatR[i] = (curChannels > 1) ? fData[i * curChannels + 1] : inFloatL[i];
                     }
                 } else {
                     const int16_t* sData = reinterpret_cast<const int16_t*>(pData);
                     for (UINT32 i = 0; i < numFramesRead; ++i) {
-                        inFloatL[i] = sData[i * m_channels + 0] / 32768.0f;
-                        inFloatR[i] = (m_channels > 1) ? sData[i * m_channels + 1] / 32768.0f : inFloatL[i];
+                        inFloatL[i] = sData[i * curChannels + 0] / 32768.0f;
+                        inFloatR[i] = (curChannels > 1) ? sData[i * curChannels + 1] / 32768.0f : inFloatL[i];
                     }
                 }
 
-                if (m_sampleRate == 48000) {
+                if (curSampleRate == 48000) {
                     pcm16Buffer.resize(numFramesRead * 2);
                     for (UINT32 i = 0; i < numFramesRead; ++i) {
                         float l = std::clamp(inFloatL[i], -1.0f, 1.0f);
@@ -183,7 +280,7 @@ void WasapiCapture::CaptureThreadProc() {
                     }
                 } else {
                     // Resample hardware sampleRate -> 48000Hz Stereo
-                    double ratio = static_cast<double>(m_sampleRate) / 48000.0;
+                    double ratio = static_cast<double>(curSampleRate) / 48000.0;
                     size_t outFrames = static_cast<size_t>((numFramesRead - captureResamplePos) / ratio);
                     if (outFrames > 0) {
                         pcm16Buffer.resize(outFrames * 2);
@@ -246,8 +343,16 @@ void WasapiCapture::CaptureThreadProc() {
         }
     }
 
-    audioClient->Stop();
-    CoTaskMemFree(mixFormat);
+    if (enumerator && notifier) {
+        enumerator->UnregisterEndpointNotificationCallback(notifier.Get());
+    }
+
+    if (audioClient) {
+        audioClient->Stop();
+    }
+    if (mixFormat) {
+        CoTaskMemFree(mixFormat);
+    }
 
     if (hAvrt) {
         AvRevertMmThreadCharacteristics(hAvrt);

@@ -621,7 +621,18 @@ bool MainWindow::StartSender() {
     // 2. Init Audio Encoder & Capture
     if (captureAudio) {
         m_audioEncoder = std::make_unique<WmfAudioEncoder>();
-        m_audioEncoder->Initialize(48000, 2, 128000);
+        if (!m_audioEncoder->Initialize(48000, 2, 128000)) {
+            Logger::W("MainWindow", "Failed to initialize WmfAudioEncoder (48000Hz, Stereo, 128kbps)");
+        } else {
+            // Send initial Audio CodecConfig (AAC-LC 48000Hz 2ch -> 0x11, 0x90)
+            const uint8_t aacConfig[2] = { 0x11, 0x90 };
+            if (m_udpStreamer && m_udpStreamer->IsRunning()) {
+                m_udpStreamer->SendFrame(aacConfig, sizeof(aacConfig), 0, false, true, false, true);
+            } else if (m_tcpStreamer && m_tcpStreamer->IsConnected()) {
+                m_tcpStreamer->SendFrame(aacConfig, sizeof(aacConfig), 0, false, true, false, true);
+            }
+        }
+
         m_audioEncoder->SetEncodedCallback([this](const uint8_t* data, size_t size, int64_t timestampMs) {
             if (!m_isStreaming) return;
             if (m_udpStreamer && m_udpStreamer->IsRunning()) {
