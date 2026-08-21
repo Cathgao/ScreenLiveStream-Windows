@@ -201,6 +201,8 @@ void UdpReceiver::ProcessUdpvPacket(const uint8_t* buffer, int length, const soc
         it = m_udpvBuffers.find(seq);
     }
 
+    if (it == m_udpvBuffers.end()) return;
+
     auto& fb = it->second;
     fb.lastUpdate = std::chrono::steady_clock::now();
 

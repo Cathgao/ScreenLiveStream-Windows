@@ -29,6 +29,7 @@ private:
 
     std::mutex m_queueMutex;
     std::vector<uint8_t> m_pcmQueue;
+    size_t m_queueReadOffset = 0;
 
     void PlayThreadProc();
 };

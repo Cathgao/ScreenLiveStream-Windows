@@ -26,16 +26,23 @@ void WasapiPlayer::Stop() {
     }
     std::lock_guard<std::mutex> lock(m_queueMutex);
     m_pcmQueue.clear();
+    m_queueReadOffset = 0;
 }
 
 void WasapiPlayer::PushPcm(const uint8_t* pcmData, size_t bytes) {
     if (!m_isPlaying || !pcmData || bytes == 0) return;
 
     std::lock_guard<std::mutex> lock(m_queueMutex);
-    // Limit buffer to max 200ms to avoid audio latency buildup
+    size_t activeBytes = m_pcmQueue.size() - m_queueReadOffset;
     size_t maxBytes = (m_sampleRate * m_channels * 2 * 200) / 1000;
-    if (m_pcmQueue.size() > maxBytes) {
-        m_pcmQueue.erase(m_pcmQueue.begin(), m_pcmQueue.begin() + (m_pcmQueue.size() - maxBytes));
+    if (activeBytes > maxBytes) {
+        m_queueReadOffset = m_pcmQueue.size() - maxBytes;
+    }
+
+    // Periodic compaction when offset exceeds 64KB
+    if (m_queueReadOffset > 65536) {
+        m_pcmQueue.erase(m_pcmQueue.begin(), m_pcmQueue.begin() + m_queueReadOffset);
+        m_queueReadOffset = 0;
     }
     m_pcmQueue.insert(m_pcmQueue.end(), pcmData, pcmData + bytes);
 }
@@ -152,12 +159,18 @@ void WasapiPlayer::PlayThreadProc() {
 
                     {
                         std::lock_guard<std::mutex> lock(m_queueMutex);
-                        if (m_pcmQueue.size() >= inBytesNeeded) {
+                        size_t availableBytes = m_pcmQueue.size() - m_queueReadOffset;
+                        if (availableBytes >= inBytesNeeded) {
+                            const uint8_t* pSrc = m_pcmQueue.data() + m_queueReadOffset;
                             popBuffer.assign(
-                                reinterpret_cast<const int16_t*>(m_pcmQueue.data()),
-                                reinterpret_cast<const int16_t*>(m_pcmQueue.data()) + (numFramesAvailable * m_channels)
+                                reinterpret_cast<const int16_t*>(pSrc),
+                                reinterpret_cast<const int16_t*>(pSrc) + (numFramesAvailable * m_channels)
                             );
-                            m_pcmQueue.erase(m_pcmQueue.begin(), m_pcmQueue.begin() + inBytesNeeded);
+                            m_queueReadOffset += inBytesNeeded;
+                            if (m_queueReadOffset == m_pcmQueue.size()) {
+                                m_pcmQueue.clear();
+                                m_queueReadOffset = 0;
+                            }
                             hasData = true;
                         }
                     }

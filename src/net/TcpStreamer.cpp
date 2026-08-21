@@ -100,28 +100,49 @@ void TcpStreamer::SendFrame(
     header[18] = static_cast<uint8_t>((payloadLen >> 8) & 0xFF);
     header[19] = static_cast<uint8_t>(payloadLen & 0xFF);
 
-    // Send 20-byte header
-    int sent = 0;
-    while (sent < 20 && m_isConnected) {
-        int n = send(m_sock, reinterpret_cast<const char*>(header) + sent, 20 - sent, 0);
-        if (n <= 0) {
-            m_isConnected = false;
-            return;
-        }
-        sent += n;
-        m_sentBytes.fetch_add(n);
+    // Use WSASend with scatter-gather buffers to transmit Header + Payload in a single kernel packet
+    WSABUF wsaBufs[2];
+    wsaBufs[0].buf = reinterpret_cast<char*>(header);
+    wsaBufs[0].len = 20;
+    wsaBufs[1].buf = const_cast<char*>(reinterpret_cast<const char*>(data));
+    wsaBufs[1].len = static_cast<ULONG>(size);
+
+    DWORD bytesSent = 0;
+    DWORD totalExpected = 20 + static_cast<DWORD>(size);
+
+    int ret = WSASend(m_sock, wsaBufs, 2, &bytesSent, 0, nullptr, nullptr);
+    if (ret == 0 && bytesSent == totalExpected) {
+        m_sentBytes.fetch_add(bytesSent);
+        return;
     }
 
-    // Send payload
-    sent = 0;
-    int toSend = static_cast<int>(size);
-    while (sent < toSend && m_isConnected) {
-        int n = send(m_sock, reinterpret_cast<const char*>(data) + sent, toSend - sent, 0);
-        if (n <= 0) {
-            m_isConnected = false;
-            return;
+    if (ret == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
+        m_isConnected = false;
+        return;
+    }
+
+    DWORD totalSent = bytesSent;
+    m_sentBytes.fetch_add(bytesSent);
+
+    // Fallback loop if partial socket transmission occurred
+    while (totalSent < totalExpected && m_isConnected) {
+        if (totalSent < 20) {
+            int n = send(m_sock, reinterpret_cast<const char*>(header) + totalSent, 20 - totalSent, 0);
+            if (n <= 0) {
+                m_isConnected = false;
+                return;
+            }
+            totalSent += n;
+            m_sentBytes.fetch_add(n);
+        } else {
+            DWORD payloadOffset = totalSent - 20;
+            int n = send(m_sock, reinterpret_cast<const char*>(data) + payloadOffset, static_cast<int>(size - payloadOffset), 0);
+            if (n <= 0) {
+                m_isConnected = false;
+                return;
+            }
+            totalSent += n;
+            m_sentBytes.fetch_add(n);
         }
-        sent += n;
-        m_sentBytes.fetch_add(n);
     }
 }

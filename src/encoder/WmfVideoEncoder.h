@@ -67,6 +67,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> m_videoProcessorEnum;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_nv12Texture;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> m_inputView;
+    ID3D11Texture2D* m_lastBgraTexture = nullptr;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> m_outputView;
 
     int m_width = 0;

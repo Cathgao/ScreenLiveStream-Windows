@@ -40,6 +40,7 @@ void WmfVideoEncoder::Shutdown() {
     m_codecApi = nullptr;
     m_outputView = nullptr;
     m_inputView = nullptr;
+    m_lastBgraTexture = nullptr;
     m_videoProcessor = nullptr;
     m_videoProcessorEnum = nullptr;
     m_videoContext = nullptr;
@@ -118,32 +119,37 @@ bool WmfVideoEncoder::InitColorConverter() {
         return false;
     }
 
+    m_inputView = nullptr;
+    m_lastBgraTexture = nullptr;
     return true;
 }
 
 bool WmfVideoEncoder::ConvertBgraToNv12(ID3D11Texture2D* bgraTexture) {
     if (!bgraTexture || !m_videoContext || !m_videoProcessor || !m_outputView) return false;
 
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inViewDesc = {};
-    inViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    inViewDesc.Texture2D.MipSlice = 0;
-    inViewDesc.Texture2D.ArraySlice = 0;
+    if (!m_inputView || m_lastBgraTexture != bgraTexture) {
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inViewDesc = {};
+        inViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        inViewDesc.Texture2D.MipSlice = 0;
+        inViewDesc.Texture2D.ArraySlice = 0;
 
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> inputView;
-    HRESULT hr = m_videoDevice->CreateVideoProcessorInputView(bgraTexture, m_videoProcessorEnum.Get(), &inViewDesc, &inputView);
-    if (FAILED(hr)) {
-        static int s_err1 = 0;
-        if (s_err1++ < 3) {
-            Logger::E("WmfVideoEncoder", "CreateVideoProcessorInputView failed, hr = 0x" + std::to_string(hr));
+        m_inputView = nullptr;
+        HRESULT hr = m_videoDevice->CreateVideoProcessorInputView(bgraTexture, m_videoProcessorEnum.Get(), &inViewDesc, &m_inputView);
+        if (FAILED(hr)) {
+            static int s_err1 = 0;
+            if (s_err1++ < 3) {
+                Logger::E("WmfVideoEncoder", "CreateVideoProcessorInputView failed, hr = 0x" + std::to_string(hr));
+            }
+            return false;
         }
-        return false;
+        m_lastBgraTexture = bgraTexture;
     }
 
     D3D11_VIDEO_PROCESSOR_STREAM stream = {};
     stream.Enable = TRUE;
-    stream.pInputSurface = inputView.Get();
+    stream.pInputSurface = m_inputView.Get();
 
-    hr = m_videoContext->VideoProcessorBlt(m_videoProcessor.Get(), m_outputView.Get(), 0, 1, &stream);
+    HRESULT hr = m_videoContext->VideoProcessorBlt(m_videoProcessor.Get(), m_outputView.Get(), 0, 1, &stream);
     if (FAILED(hr)) {
         static int s_err2 = 0;
         if (s_err2++ < 3) {

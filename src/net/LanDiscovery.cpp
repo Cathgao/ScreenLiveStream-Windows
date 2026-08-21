@@ -198,6 +198,7 @@ void LanDiscovery::ScanThreadProc() {
     globalBroadcastAddr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
 
     auto lastPingTime = std::chrono::steady_clock::now() - std::chrono::seconds(5);
+    auto localIfs = GetLocalInterfaces();
     char buf[2048];
 
     while (m_isScanning) {
@@ -207,7 +208,7 @@ void LanDiscovery::ScanThreadProc() {
 
         if (shouldPing) {
             lastPingTime = now;
-            auto localIfs = GetLocalInterfaces();
+            localIfs = GetLocalInterfaces();
 
             // 1. Send to global broadcast 255.255.255.255:9998
             sendto(sock, Protocol::DISCOVERY_PING.c_str(), (int)Protocol::DISCOVERY_PING.length(), 0,
@@ -237,8 +238,7 @@ void LanDiscovery::ScanThreadProc() {
             char ipStr[INET_ADDRSTRLEN] = {};
             inet_ntop(AF_INET, &fromAddr.sin_addr, ipStr, sizeof(ipStr));
 
-            // Filter out self-discovery packets
-            auto localIfs = GetLocalInterfaces();
+            // Filter out self-discovery packets using cached interface list
             bool isSelf = false;
             for (const auto& iface : localIfs) {
                 if (iface.ip == ipStr) {
