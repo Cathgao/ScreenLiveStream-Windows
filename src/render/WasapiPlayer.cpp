@@ -1,5 +1,6 @@
 #include "WasapiPlayer.h"
 #include "Logger.h"
+#include "Protocol.h"
 #include <avrt.h>
 #include <timeapi.h>
 #include <cmath>
@@ -23,8 +24,10 @@ bool WasapiPlayer::Start(int sampleRate, int channels) {
 
     m_sampleRate = (sampleRate > 0) ? sampleRate : 48000;
     m_channels = (channels > 0) ? channels : 2;
-    m_prebufferSamples = static_cast<size_t>((m_sampleRate * m_channels * 15) / 1000); // 15ms initial prebuffer
+    m_prebufferSamples = static_cast<size_t>((m_sampleRate * m_channels * 15) / 1000); // 15ms minimal hardware prebuffer
     m_prebuffering = true;
+    m_currentAudioPtsMs.store(-1, std::memory_order_relaxed);
+    m_lastAudioPtsLocalTimeMs.store(0, std::memory_order_relaxed);
 
     m_isPlaying.store(true, std::memory_order_release);
     m_playThread = std::thread(&WasapiPlayer::PlayThreadProc, this);
@@ -39,15 +42,25 @@ void WasapiPlayer::Stop() {
     }
     std::lock_guard<std::mutex> lock(m_queueMutex);
     m_pcmQueue.clear();
+    m_ptsSegments.clear();
     m_queueReadOffset = 0;
     m_prebuffering = true;
+    m_currentAudioPtsMs.store(-1, std::memory_order_relaxed);
+    m_lastAudioPtsLocalTimeMs.store(0, std::memory_order_relaxed);
 }
 
-void WasapiPlayer::SetAudioDelayMs(int delayMs) {
-    m_audioDelayMs.store(std::clamp(delayMs, -200, 500), std::memory_order_release);
+int64_t WasapiPlayer::GetCurrentRenderedAudioPtsMs() const {
+    int64_t basePts = m_currentAudioPtsMs.load(std::memory_order_relaxed);
+    if (basePts < 0) return -1;
+    int64_t elapsed = Protocol::GetCurrentMillis() - m_lastAudioPtsLocalTimeMs.load(std::memory_order_relaxed);
+    if (elapsed > 400) {
+        // Audio stream paused / stalled
+        return -1;
+    }
+    return basePts + elapsed;
 }
 
-void WasapiPlayer::PushPcm(const uint8_t* pcmData, size_t bytes, int64_t /*timestampMs*/) {
+void WasapiPlayer::PushPcm(const uint8_t* pcmData, size_t bytes, int64_t timestampMs) {
     if (!m_isPlaying.load(std::memory_order_relaxed) || !pcmData || bytes < sizeof(int16_t)) return;
 
     size_t sampleCount = bytes / sizeof(int16_t);
@@ -61,15 +74,33 @@ void WasapiPlayer::PushPcm(const uint8_t* pcmData, size_t bytes, int64_t /*times
         m_queueReadOffset = 0;
     }
 
-    // Low-latency backlog cap (~75ms, approx 3.5 AAC frames) to keep live audio tightly synced with real-time video
+    // Ultra-low latency audio buffer cap (~75ms, approx 3.5 AAC frames) to strictly prevent audio latency accumulation
     size_t maxBacklog = static_cast<size_t>((m_sampleRate * m_channels * 75) / 1000);
     size_t activeSamples = m_pcmQueue.size() - m_queueReadOffset;
     if (activeSamples > maxBacklog) {
-        size_t targetActive = static_cast<size_t>((m_sampleRate * m_channels * 35) / 1000);
+        size_t targetActive = static_cast<size_t>((m_sampleRate * m_channels * 20) / 1000);
+        size_t pruneCount = (m_pcmQueue.size() > targetActive) ? (m_pcmQueue.size() - targetActive - m_queueReadOffset) : 0;
         m_queueReadOffset = (m_pcmQueue.size() > targetActive) ? (m_pcmQueue.size() - targetActive) : 0;
+
+        // Prune PTS segments to stay synchronized with audio buffer truncation
+        while (pruneCount > 0 && !m_ptsSegments.empty()) {
+            if (m_ptsSegments.front().sampleCount <= pruneCount) {
+                pruneCount -= m_ptsSegments.front().sampleCount;
+                m_ptsSegments.pop_front();
+            } else {
+                m_ptsSegments.front().sampleCount -= pruneCount;
+                m_ptsSegments.front().ptsMs += static_cast<int64_t>((pruneCount * 1000.0) / (m_sampleRate * m_channels));
+                pruneCount = 0;
+            }
+        }
     }
 
     m_pcmQueue.insert(m_pcmQueue.end(), pSrc, pSrc + sampleCount);
+    if (timestampMs >= 0) {
+        m_ptsSegments.push_back({ timestampMs, sampleCount });
+    } else if (!m_ptsSegments.empty()) {
+        m_ptsSegments.back().sampleCount += sampleCount;
+    }
 }
 
 void WasapiPlayer::PlayThreadProc() {
@@ -216,6 +247,29 @@ void WasapiPlayer::PlayThreadProc() {
     std::vector<int16_t> tempInputPcm;
     double softwareResamplePos = 0.0;
 
+    auto updateAudioPts = [&](size_t consumedSamples, UINT32 paddingFrames) {
+        size_t remaining = consumedSamples;
+        int64_t currentPts = -1;
+        while (remaining > 0 && !m_ptsSegments.empty()) {
+            if (m_ptsSegments.front().sampleCount <= remaining) {
+                remaining -= m_ptsSegments.front().sampleCount;
+                currentPts = m_ptsSegments.front().ptsMs;
+                m_ptsSegments.pop_front();
+            } else {
+                currentPts = m_ptsSegments.front().ptsMs;
+                m_ptsSegments.front().sampleCount -= remaining;
+                m_ptsSegments.front().ptsMs += static_cast<int64_t>((remaining * 1000.0) / (m_sampleRate * m_channels));
+                remaining = 0;
+            }
+        }
+        if (currentPts >= 0) {
+            int64_t wasapiDelayMs = (static_cast<int64_t>(paddingFrames) * 1000LL) / m_sampleRate;
+            int64_t actualSpeakerPts = (std::max)(int64_t(0), currentPts - wasapiDelayMs);
+            m_currentAudioPtsMs.store(actualSpeakerPts, std::memory_order_relaxed);
+            m_lastAudioPtsLocalTimeMs.store(Protocol::GetCurrentMillis(), std::memory_order_relaxed);
+        }
+    };
+
     while (m_isPlaying.load(std::memory_order_relaxed)) {
         UINT32 numPaddingFrames = 0;
         hr = audioClient->GetCurrentPadding(&numPaddingFrames);
@@ -247,6 +301,7 @@ void WasapiPlayer::PlayThreadProc() {
                             const int16_t* pSrc = m_pcmQueue.data() + m_queueReadOffset;
                             std::memcpy(pDst16, pSrc, samplesNeeded * sizeof(int16_t));
                             m_queueReadOffset += samplesNeeded;
+                            updateAudioPts(samplesNeeded, numPaddingFrames);
                             if (m_queueReadOffset >= m_pcmQueue.size()) {
                                 m_pcmQueue.clear();
                                 m_queueReadOffset = 0;
@@ -257,6 +312,7 @@ void WasapiPlayer::PlayThreadProc() {
                             const int16_t* pSrc = m_pcmQueue.data() + m_queueReadOffset;
                             std::memcpy(pDst16, pSrc, availableSamples * sizeof(int16_t));
                             std::memset(pDst16 + availableSamples, 0, (samplesNeeded - availableSamples) * sizeof(int16_t));
+                            updateAudioPts(availableSamples, numPaddingFrames);
                             m_pcmQueue.clear();
                             m_queueReadOffset = 0;
                             renderClient->ReleaseBuffer(numFramesAvailable, 0);
@@ -346,6 +402,7 @@ void WasapiPlayer::PlayThreadProc() {
                                 std::lock_guard<std::mutex> lock(m_queueMutex);
                                 size_t consumedSamples = std::min(consumedInFrames * m_channels, m_pcmQueue.size() - m_queueReadOffset);
                                 m_queueReadOffset += consumedSamples;
+                                updateAudioPts(consumedSamples, numPaddingFrames);
                                 if (m_queueReadOffset >= m_pcmQueue.size()) {
                                     m_pcmQueue.clear();
                                     m_queueReadOffset = 0;

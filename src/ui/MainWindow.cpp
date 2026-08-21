@@ -817,10 +817,13 @@ void MainWindow::AutoAdaptReceiverWindow(int videoW, int videoH) {
 }
 
 void MainWindow::ReceiverDecodeLoop() {
-    Logger::I("MainWindow", "Receiver Decode Loop thread started (FFmpeg Engine).");
+    Logger::I("MainWindow", "Receiver Decode Loop thread started (Auto A/V Sync Engine).");
+
+    int64_t syncAnchorVideoPts = -1;
+    int64_t syncAnchorLocalMs = -1;
+
     while (m_isDecoding) {
         ReceiverVideoPacket pkt;
-        bool isLatestInBatch = false;
         {
             std::unique_lock<std::mutex> lock(m_frameQueueMutex);
             m_frameQueueCv.wait(lock, [this] {
@@ -831,19 +834,67 @@ void MainWindow::ReceiverDecodeLoop() {
 
             pkt = std::move(m_frameQueue.front());
             m_frameQueue.pop_front();
-
-            // Decode all packets for P-frame reference continuity, but only present the latest frame in batch
-            isLatestInBatch = m_frameQueue.empty();
         }
 
-        if (m_videoDecoder && !pkt.data.empty()) {
-            VideoCodecType targetCodec = pkt.isHevc ? VideoCodecType::H265_HEVC : VideoCodecType::H264;
-            if (m_videoDecoder->GetCodecType() != targetCodec) {
-                m_videoDecoder->Initialize(targetCodec);
+        if (!m_videoDecoder || pkt.data.empty()) continue;
+
+        VideoCodecType targetCodec = pkt.isHevc ? VideoCodecType::H265_HEVC : VideoCodecType::H264;
+        if (m_videoDecoder->GetCodecType() != targetCodec) {
+            m_videoDecoder->Initialize(targetCodec);
+        }
+
+        // Automatic A/V Synchronization Strategy
+        int64_t currentAudioPts = (m_wasapiPlayer && m_wasapiPlayer->IsPlaying())
+                                    ? m_wasapiPlayer->GetCurrentRenderedAudioPtsMs()
+                                    : -1;
+        int64_t nowMs = Protocol::GetCurrentMillis();
+        bool shouldRender = true;
+
+        if (pkt.timestampMs >= 0) {
+            if (currentAudioPts >= 0) {
+                // Audio is actively playing: synchronize Video PTS directly to Audio PTS (Audio Master Clock)
+                syncAnchorVideoPts = -1;
+                int64_t diff = pkt.timestampMs - currentAudioPts;
+
+                if (std::abs(diff) > 2000) {
+                    // Time discontinuity (e.g. stream restart / reconnection), render immediately
+                    shouldRender = true;
+                } else if (diff < -35) {
+                    // Video is late (>35ms behind Audio): decode for reference, but skip render to catch up immediately!
+                    shouldRender = false;
+                } else if (diff > 5) {
+                    // Video is ahead of Audio (e.g. video arrived earlier than audio output):
+                    // Sleep briefly so video matches audio playback time!
+                    int64_t waitMs = (std::min)(diff, (int64_t)80);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+                    shouldRender = true;
+                } else {
+                    // Within [-35ms, 5ms] sync window: perfect match!
+                    shouldRender = true;
+                }
+            } else {
+                // Video-only mode (Audio absent or silent): smooth local clock pacing
+                if (syncAnchorVideoPts < 0 || std::abs((nowMs - syncAnchorLocalMs) - (pkt.timestampMs - syncAnchorVideoPts)) > 1000) {
+                    syncAnchorVideoPts = pkt.timestampMs;
+                    syncAnchorLocalMs = nowMs;
+                }
+                int64_t expectedTimeMs = syncAnchorLocalMs + (pkt.timestampMs - syncAnchorVideoPts);
+                int64_t waitMs = expectedTimeMs - nowMs;
+                if (waitMs > 2) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds((std::min)(waitMs, (int64_t)50)));
+                    shouldRender = true;
+                } else if (waitMs < -35) {
+                    // Video running late, skip render to catch up
+                    shouldRender = false;
+                    syncAnchorLocalMs = nowMs - (pkt.timestampMs - syncAnchorVideoPts); // smoothly re-anchor
+                } else {
+                    shouldRender = true;
+                }
             }
-            m_shouldRenderFrame.store(isLatestInBatch, std::memory_order_relaxed);
-            m_videoDecoder->DecodeNalu(pkt.data.data(), pkt.data.size(), pkt.timestampMs);
         }
+
+        m_shouldRenderFrame.store(shouldRender, std::memory_order_relaxed);
+        m_videoDecoder->DecodeNalu(pkt.data.data(), pkt.data.size(), pkt.timestampMs);
     }
     Logger::I("MainWindow", "Receiver Decode Loop thread terminated.");
 }
@@ -879,14 +930,10 @@ bool MainWindow::StartReceiver() {
     m_videoDecoder = std::make_unique<FfmpegVideoDecoder>(m_d3dResources.device.Get());
     m_videoDecoder->Initialize(VideoCodecType::H265_HEVC);
     m_videoDecoder->SetDecodedCallback([this](ID3D11Texture2D* tex, int64_t ts, int w, int h) {
+        (void)ts;
         m_statWidth = w;
         m_statHeight = h;
         m_fpsCounter.fetch_add(1);
-
-        if (ts >= 0) {
-            m_currentVideoPtsMs.store(ts, std::memory_order_relaxed);
-            m_currentVideoPtsLocalTimeMs.store(Protocol::GetCurrentMillis(), std::memory_order_relaxed);
-        }
 
         if (m_hwnd && (m_postedAdaptW.load() != w || m_postedAdaptH.load() != h)) {
             m_postedAdaptW = w;
@@ -918,8 +965,12 @@ bool MainWindow::StartReceiver() {
 
             {
                 std::lock_guard<std::mutex> lock(m_frameQueueMutex);
-                if (isKeyframe && m_frameQueue.size() > 5) {
+                if (isKeyframe && m_frameQueue.size() > 3) {
                     m_frameQueue.clear();
+                } else if (m_frameQueue.size() > 30) {
+                    while (m_frameQueue.size() > 10) {
+                        m_frameQueue.pop_front();
+                    }
                 }
                 m_frameQueue.push_back(std::move(pkt));
             }
@@ -949,8 +1000,12 @@ bool MainWindow::StartReceiver() {
 
             {
                 std::lock_guard<std::mutex> lock(m_frameQueueMutex);
-                if (isKeyframe && m_frameQueue.size() > 5) {
+                if (isKeyframe && m_frameQueue.size() > 3) {
                     m_frameQueue.clear();
+                } else if (m_frameQueue.size() > 30) {
+                    while (m_frameQueue.size() > 10) {
+                        m_frameQueue.pop_front();
+                    }
                 }
                 m_frameQueue.push_back(std::move(pkt));
             }
@@ -975,13 +1030,6 @@ bool MainWindow::StartReceiver() {
     UpdateUiMode();
     UpdateStatusText();
     return true;
-}
-
-int64_t MainWindow::GetCurrentRenderedVideoPtsMs() const {
-    int64_t basePts = m_currentVideoPtsMs.load(std::memory_order_relaxed);
-    if (basePts < 0) return -1;
-    int64_t elapsed = Protocol::GetCurrentMillis() - m_currentVideoPtsLocalTimeMs.load(std::memory_order_relaxed);
-    return basePts + elapsed;
 }
 
 void MainWindow::StopReceiver() {
@@ -1498,31 +1546,6 @@ LRESULT CALLBACK MainWindow::ReceiverWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 int w = LOWORD(lParam);
                 int h = HIWORD(lParam);
                 pThis->m_d3dRenderer->Resize(w, h);
-            }
-            break;
-        }
-
-        case WM_KEYDOWN: {
-            if (pThis && pThis->m_wasapiPlayer) {
-                int cur = pThis->m_wasapiPlayer->GetAudioDelayMs();
-                int delta = 0;
-                if (wParam == VK_OEM_4 || wParam == VK_LEFT || wParam == VK_SUBTRACT || wParam == VK_OEM_MINUS) { // [ or Left or -
-                    delta = -10;
-                } else if (wParam == VK_OEM_6 || wParam == VK_RIGHT || wParam == VK_ADD || wParam == VK_OEM_PLUS) { // ] or Right or +
-                    delta = +10;
-                } else if (wParam == '0') {
-                    pThis->m_wasapiPlayer->SetAudioDelayMs(0);
-                    std::wstring title = L"Live Stream Receiver - 音画同步偏移: 0 ms";
-                    SetWindowTextW(hwnd, title.c_str());
-                    break;
-                }
-
-                if (delta != 0) {
-                    int nextVal = std::clamp(cur + delta, -200, 500);
-                    pThis->m_wasapiPlayer->SetAudioDelayMs(nextVal);
-                    std::wstring title = L"Live Stream Receiver - 音画同步偏移: " + (nextVal >= 0 ? std::wstring(L"+") : std::wstring()) + std::to_wstring(nextVal) + L" ms (快捷键 [ / ] 调节, 0 复位)";
-                    SetWindowTextW(hwnd, title.c_str());
-                }
             }
             break;
         }

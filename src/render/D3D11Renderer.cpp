@@ -220,6 +220,6 @@ void D3D11Renderer::RenderFrame(ID3D11Texture2D* frameTexture, int videoWidth, i
 
     HRESULT hr = m_videoContext->VideoProcessorBlt(m_videoProcessor.Get(), m_outputView.Get(), 0, 1, &stream);
     if (SUCCEEDED(hr)) {
-        m_swapChain->Present(1, 0);
+        m_swapChain->Present(0, 0);
     }
 }
