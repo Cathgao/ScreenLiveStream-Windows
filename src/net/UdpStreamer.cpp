@@ -106,7 +106,8 @@ void UdpStreamer::SendFrame(
         packet[25] = packet[26] = packet[27] = 0;
         std::memcpy(&packet[28], data, size);
 
-        sendto(m_sock, (const char*)packet.data(), (int)packet.size(), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
+        int sent = sendto(m_sock, (const char*)packet.data(), (int)packet.size(), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
+        if (sent > 0) m_sentBytes.fetch_add(sent);
         return;
     }
 
@@ -144,7 +145,8 @@ void UdpStreamer::SendFrame(
         packet[25] = packet[26] = packet[27] = 0;
         std::memcpy(&packet[28], data + offset, chunk);
 
-        sendto(m_sock, (const char*)packet.data(), (int)packet.size(), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
+        int sent = sendto(m_sock, (const char*)packet.data(), (int)packet.size(), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
+        if (sent > 0) m_sentBytes.fetch_add(sent);
 
         // Compute XOR FEC parity for group
         int groupIdx = i % FEC_GROUP_SIZE;
@@ -171,7 +173,8 @@ void UdpStreamer::SendFrame(
             fecPkt[25] = fecPkt[26] = fecPkt[27] = 0;
             std::memcpy(&fecPkt[28], fecBuffer.data(), fecBuffer.size());
 
-            sendto(m_sock, (const char*)fecPkt.data(), (int)fecPkt.size(), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
+            int fecSent = sendto(m_sock, (const char*)fecPkt.data(), (int)fecPkt.size(), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
+            if (fecSent > 0) m_sentBytes.fetch_add(fecSent);
         }
 
         offset += chunk;
@@ -189,7 +192,8 @@ void UdpStreamer::RecvThreadProc() {
             int64_t nanos = Protocol::GetCurrentNanos();
             auto pingPkt = Protocol::BuildPingPacket(++m_pingSeq, nanos);
             std::lock_guard<std::mutex> lock(m_sendMutex);
-            sendto(m_sock, (const char*)pingPkt.data(), (int)pingPkt.size(), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
+            int sent = sendto(m_sock, (const char*)pingPkt.data(), (int)pingPkt.size(), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
+            if (sent > 0) m_sentBytes.fetch_add(sent);
         }
 
         sockaddr_in fromAddr = {};
@@ -212,10 +216,10 @@ void UdpStreamer::RecvThreadProc() {
                     // Send stats beacon
                     auto statsPkt = Protocol::BuildPingStatsPacket(rtt, 0);
                     std::lock_guard<std::mutex> lock(m_sendMutex);
-                    sendto(m_sock, (const char*)statsPkt.data(), (int)statsPkt.size(), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
+                    int sent = sendto(m_sock, (const char*)statsPkt.data(), (int)statsPkt.size(), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
+                    if (sent > 0) m_sentBytes.fetch_add(sent);
                 }
             }
         }
     }
 }
-

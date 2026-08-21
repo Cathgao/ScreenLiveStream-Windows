@@ -28,10 +28,15 @@ public:
         bool isAudio = false
     );
 
+    uint64_t GetAndResetSentBytes() {
+        return m_sentBytes.exchange(0);
+    }
+
 private:
     std::atomic<bool> m_isConnected{ false };
     SOCKET m_sock = INVALID_SOCKET;
     std::mutex m_sendMutex;
     uint32_t m_videoSeq = 0;
     uint32_t m_audioSeq = 0;
+    std::atomic<uint64_t> m_sentBytes{ 0 };
 };

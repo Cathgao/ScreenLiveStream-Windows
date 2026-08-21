@@ -489,6 +489,12 @@ bool MainWindow::StartSender() {
     const auto& target = m_captureTargets[targetIdx];
     int initW = target.width > 0 ? target.width : 1920;
     int initH = target.height > 0 ? target.height : 1080;
+    m_statWidth = initW;
+    m_statHeight = initH;
+    m_fpsCounter = 0;
+    m_statFps = 0;
+    m_statBitrateKbps = 0;
+    m_statRttMs = 0;
 
     m_videoEncoder = std::make_unique<WmfVideoEncoder>(m_d3dResources.device.Get(), m_d3dResources.dxgiManager.Get());
     if (!m_videoEncoder->Initialize(initW, initH, fps, bitrateKbps, codecType)) {
@@ -498,6 +504,7 @@ bool MainWindow::StartSender() {
     }
 
     m_videoEncoder->SetEncodedCallback([this](const uint8_t* data, size_t size, int64_t timestampMs, bool isKeyframe, bool isCodecConfig, bool isHevc) {
+        m_fpsCounter.fetch_add(1);
         if (m_udpStreamer && m_udpStreamer->IsRunning()) {
             m_udpStreamer->SendFrame(data, size, timestampMs, isKeyframe, isCodecConfig, isHevc, false);
         } else if (m_tcpStreamer && m_tcpStreamer->IsConnected()) {
@@ -529,6 +536,10 @@ bool MainWindow::StartSender() {
 
 void MainWindow::StopSender() {
     m_isStreaming = false;
+    m_statFps = 0;
+    m_statBitrateKbps = 0;
+    m_statRttMs = 0;
+    m_fpsCounter = 0;
     if (m_wgcCapture) {
         m_wgcCapture->StopCapture();
         m_wgcCapture = nullptr;
@@ -687,13 +698,16 @@ bool MainWindow::StartReceiver() {
     });
 
     // 2. FFmpeg Video Decoder (D3D11VA Hardware Accelerated)
-    m_fpsDecodedCount = 0;
+    m_fpsCounter = 0;
+    m_statFps = 0;
+    m_statBitrateKbps = 0;
+    m_statRttMs = 0;
     m_videoDecoder = std::make_unique<FfmpegVideoDecoder>(m_d3dResources.device.Get());
     m_videoDecoder->Initialize(VideoCodecType::H265_HEVC);
     m_videoDecoder->SetDecodedCallback([this](ID3D11Texture2D* tex, int64_t, int w, int h) {
         m_statWidth = w;
         m_statHeight = h;
-        m_fpsDecodedCount.fetch_add(1);
+        m_fpsCounter.fetch_add(1);
 
         if (m_hwnd && (m_postedAdaptW.load() != w || m_postedAdaptH.load() != h)) {
             m_postedAdaptW = w;
@@ -816,6 +830,10 @@ void MainWindow::StopReceiver() {
         m_wasapiPlayer->Stop();
         m_wasapiPlayer = nullptr;
     }
+    m_statFps = 0;
+    m_statBitrateKbps = 0;
+    m_statRttMs = 0;
+    m_fpsCounter = 0;
     DestroyReceiverWindow();
     UpdateUiMode();
     UpdateStatusText();
@@ -1227,15 +1245,36 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
         case WM_TIMER: {
             if (wParam == ID_TIMER_STATS) {
-                if (pThis->m_udpStreamer) {
-                    pThis->m_statRttMs = pThis->m_udpStreamer->GetRttMs();
+                if (pThis->m_isStreaming) {
+                    if (pThis->m_udpStreamer) {
+                        pThis->m_statRttMs = pThis->m_udpStreamer->GetRttMs();
+                        uint64_t bytes = pThis->m_udpStreamer->GetAndResetSentBytes();
+                        pThis->m_statBitrateKbps = static_cast<int>((bytes * 8) / 1000);
+                    } else if (pThis->m_tcpStreamer) {
+                        uint64_t bytes = pThis->m_tcpStreamer->GetAndResetSentBytes();
+                        pThis->m_statBitrateKbps = static_cast<int>((bytes * 8) / 1000);
+                        pThis->m_statRttMs = 0;
+                    }
+                    pThis->m_statFps = pThis->m_fpsCounter.exchange(0);
+                    pThis->UpdateStatusText();
+                } else if (pThis->m_isReceiving) {
+                    if (pThis->m_udpReceiver) {
+                        uint64_t bytes = pThis->m_udpReceiver->GetAndResetReceivedBytes();
+                        pThis->m_statBitrateKbps = static_cast<int>((bytes * 8) / 1000);
+                    } else if (pThis->m_tcpReceiver) {
+                        uint64_t bytes = pThis->m_tcpReceiver->GetAndResetReceivedBytes();
+                        pThis->m_statBitrateKbps = static_cast<int>((bytes * 8) / 1000);
+                        pThis->m_statRttMs = 0;
+                    }
+                    pThis->m_statFps = pThis->m_fpsCounter.exchange(0);
+                    pThis->UpdateStatusText();
+                } else {
+                    pThis->m_statFps = 0;
+                    pThis->m_statBitrateKbps = 0;
+                    pThis->m_statRttMs = 0;
+                    pThis->m_fpsCounter = 0;
+                    pThis->UpdateStatusText();
                 }
-                if (pThis->m_udpReceiver) {
-                    uint64_t bytes = pThis->m_udpReceiver->GetAndResetReceivedBytes();
-                    pThis->m_statBitrateKbps = static_cast<int>((bytes * 8) / 1000);
-                }
-                pThis->m_statFps = pThis->m_fpsDecodedCount.exchange(0);
-                pThis->UpdateStatusText();
             }
             break;
         }

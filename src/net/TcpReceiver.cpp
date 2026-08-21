@@ -105,6 +105,7 @@ void TcpReceiver::HandleClient(SOCKET clientSock) {
         if (!RecvExact(clientSock, headerBuf, 20, m_isRunning)) {
             break;
         }
+        m_receivedBytes.fetch_add(20);
 
         if (headerBuf[0] != 0x51 || headerBuf[1] != 0x43) { // 'Q', 'C'
             Logger::W("TcpReceiver", "Invalid TCP packet magic, dropping connection.");
@@ -142,6 +143,7 @@ void TcpReceiver::HandleClient(SOCKET clientSock) {
         if (isPingStats) {
             uint8_t statsBuf[8];
             if (RecvExact(clientSock, statsBuf, 8, m_isRunning)) {
+                m_receivedBytes.fetch_add(8);
                 // RTT and loss
             }
             continue;
@@ -152,6 +154,7 @@ void TcpReceiver::HandleClient(SOCKET clientSock) {
             if (!RecvExact(clientSock, payloadBuf.data(), payloadSize, m_isRunning)) {
                 break;
             }
+            m_receivedBytes.fetch_add(payloadSize);
         }
 
         if (isAudio) {

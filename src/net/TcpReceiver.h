@@ -25,12 +25,17 @@ public:
     void SetVideoCallback(VideoFrameCallback cb) { m_videoCallback = cb; }
     void SetAudioCallback(AudioFrameCallback cb) { m_audioCallback = cb; }
 
+    uint64_t GetAndResetReceivedBytes() {
+        return m_receivedBytes.exchange(0);
+    }
+
 private:
     std::atomic<bool> m_isRunning{ false };
     uint16_t m_listenPort = 8888;
     SOCKET m_listenSock = INVALID_SOCKET;
     SOCKET m_clientSock = INVALID_SOCKET;
     std::thread m_listenThread;
+    std::atomic<uint64_t> m_receivedBytes{ 0 };
 
     VideoFrameCallback m_videoCallback;
     AudioFrameCallback m_audioCallback;

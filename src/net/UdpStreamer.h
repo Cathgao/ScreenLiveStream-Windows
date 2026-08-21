@@ -30,6 +30,10 @@ public:
 
     int GetRttMs() const { return m_lastRttMs; }
 
+    uint64_t GetAndResetSentBytes() {
+        return m_sentBytes.exchange(0);
+    }
+
 private:
     std::atomic<bool> m_isRunning{ false };
     SOCKET m_sock = INVALID_SOCKET;
@@ -39,6 +43,7 @@ private:
     uint32_t m_audioSeq = 0;
     uint32_t m_pingSeq = 0;
     std::atomic<int> m_lastRttMs{ 0 };
+    std::atomic<uint64_t> m_sentBytes{ 0 };
 
     std::thread m_recvThread;
     void RecvThreadProc();

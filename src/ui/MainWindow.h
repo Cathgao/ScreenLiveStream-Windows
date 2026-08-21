@@ -89,7 +89,7 @@ private:
     bool m_isSenderMode = true;
 
     // Stats & Adaptation
-    std::atomic<int> m_fpsDecodedCount{ 0 };
+    std::atomic<int> m_fpsCounter{ 0 };
     std::atomic<int> m_statFps{ 0 };
     std::atomic<int> m_statBitrateKbps{ 0 };
     std::atomic<int> m_statRttMs{ 0 };

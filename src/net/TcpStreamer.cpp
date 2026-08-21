@@ -109,6 +109,7 @@ void TcpStreamer::SendFrame(
             return;
         }
         sent += n;
+        m_sentBytes.fetch_add(n);
     }
 
     // Send payload
@@ -121,5 +122,6 @@ void TcpStreamer::SendFrame(
             return;
         }
         sent += n;
+        m_sentBytes.fetch_add(n);
     }
 }
