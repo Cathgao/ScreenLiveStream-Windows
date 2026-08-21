@@ -5,6 +5,8 @@
 #include <vector>
 #include <functional>
 #include <memory>
+#include <atomic>
+#include <shared_mutex>
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Capture.h>
@@ -49,10 +51,11 @@ private:
     winrt::Windows::Graphics::Capture::GraphicsCaptureSession m_session{ nullptr };
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::FrameArrived_revoker m_frameArrivedRevoker;
 
-    bool m_isCapturing = false;
+    std::atomic<bool> m_isCapturing{ false };
     int m_captureWidth = 0;
     int m_captureHeight = 0;
     FrameCallback m_frameCallback;
+    std::shared_mutex m_frameMutex;
 
     void OnFrameArrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& sender, winrt::Windows::Foundation::IInspectable const& args);
 };

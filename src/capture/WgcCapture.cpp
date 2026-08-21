@@ -146,11 +146,11 @@ bool WgcCapture::StartCapture(const CaptureTarget& target, bool captureCursor) {
 
         Logger::I("WGC", "Target resolution: " + std::to_string(m_captureWidth) + "x" + std::to_string(m_captureHeight));
 
-        // Create Direct3D11CaptureFramePool
+        // Create Direct3D11CaptureFramePool with 4 buffers for high-framerate 120+ FPS capture
         m_framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             m_winrtDevice,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
+            4,
             itemSize
         );
 
@@ -172,6 +172,25 @@ bool WgcCapture::StartCapture(const CaptureTarget& target, bool captureCursor) {
             // Older Windows 10 versions do not have IGraphicsCaptureSession3
         }
 
+        // Win11 23H2+ / high-framerate support: unlock 120+ FPS capture interval
+        try {
+            auto session5 = m_session.as<winrt::Windows::Graphics::Capture::IGraphicsCaptureSession5>();
+            if (session5) {
+                session5.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan{ 0 });
+                Logger::I("WGC", "Successfully unlocked high-framerate MinUpdateInterval=0");
+            }
+        } catch (...) {
+            try {
+                auto sessionAbi = reinterpret_cast<IUnknown*>(winrt::get_abi(m_session));
+                Microsoft::WRL::ComPtr<ABI::Windows::Graphics::Capture::IGraphicsCaptureSession5> session5Abi;
+                if (sessionAbi && SUCCEEDED(sessionAbi->QueryInterface(IID_PPV_ARGS(&session5Abi))) && session5Abi) {
+                    ABI::Windows::Foundation::TimeSpan zeroTs = { 0 };
+                    session5Abi->put_MinUpdateInterval(zeroTs);
+                    Logger::I("WGC", "Successfully unlocked high-framerate via ABI MinUpdateInterval=0");
+                }
+            } catch (...) {}
+        }
+
         m_session.StartCapture();
         m_isCapturing = true;
         Logger::I("WGC", "Capture started successfully.");
@@ -186,8 +205,7 @@ bool WgcCapture::StartCapture(const CaptureTarget& target, bool captureCursor) {
 }
 
 void WgcCapture::StopCapture() {
-    if (!m_isCapturing) return;
-    m_isCapturing = false;
+    if (!m_isCapturing.exchange(false)) return;
 
     try {
         if (m_frameArrivedRevoker) {
@@ -204,42 +222,56 @@ void WgcCapture::StopCapture() {
         m_item = nullptr;
     } catch (...) {}
 
+    // Exclusive lock m_frameMutex to ensure any in-flight OnFrameArrived has completely finished
+    {
+        std::unique_lock<std::shared_mutex> lock(m_frameMutex);
+        m_frameCallback = nullptr;
+    }
+
     Logger::I("WGC", "Capture stopped.");
 }
 
 void WgcCapture::OnFrameArrived(Direct3D11CaptureFramePool const& sender, winrt::Windows::Foundation::IInspectable const&) {
+    std::shared_lock<std::shared_mutex> lock(m_frameMutex);
     if (!m_isCapturing) return;
 
     try {
-        auto frame = sender.TryGetNextFrame();
-        if (!frame) return;
+        while (auto frame = sender.TryGetNextFrame()) {
+            if (!m_isCapturing) break;
 
-        static std::atomic<int> s_wgcFrames{ 0 };
-        int f = ++s_wgcFrames;
-        if (f <= 3 || f % 180 == 0) {
-            Logger::I("WGC", "Captured frame #" + std::to_string(f));
-        }
-
-        auto surface = frame.Surface();
-        auto access = surface.as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
-
-        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
-        if (SUCCEEDED(access->GetInterface(__uuidof(ID3D11Texture2D), (void**)&texture))) {
-            auto size = frame.ContentSize();
-            if (size.Width != m_captureWidth || size.Height != m_captureHeight) {
-                m_captureWidth = size.Width;
-                m_captureHeight = size.Height;
-                sender.Recreate(m_winrtDevice, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+            static std::atomic<int> s_wgcFrames{ 0 };
+            int f = ++s_wgcFrames;
+            if (f <= 3 || f % 240 == 0) {
+                Logger::I("WGC", "Captured frame #" + std::to_string(f));
             }
 
-            int64_t timestampNs = Protocol::GetCurrentNanos();
-            if (m_frameCallback) {
-                m_frameCallback(texture.Get(), timestampNs, m_captureWidth, m_captureHeight);
+            auto surface = frame.Surface();
+            if (!surface) continue;
+            auto access = surface.as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+            if (!access) continue;
+
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+            if (SUCCEEDED(access->GetInterface(__uuidof(ID3D11Texture2D), (void**)&texture)) && texture) {
+                auto size = frame.ContentSize();
+                if (size.Width != m_captureWidth || size.Height != m_captureHeight) {
+                    m_captureWidth = size.Width;
+                    m_captureHeight = size.Height;
+                    sender.Recreate(m_winrtDevice, DirectXPixelFormat::B8G8R8A8UIntNormalized, 4, size);
+                }
+
+                int64_t timestampNs = Protocol::GetCurrentNanos();
+                if (m_frameCallback && m_isCapturing) {
+                    m_frameCallback(texture.Get(), timestampNs, m_captureWidth, m_captureHeight);
+                }
             }
         }
+    } catch (const winrt::hresult_error& ex) {
+        // Expected when session or frame pool closes
+        Logger::I("WGC", "WinRT frame arrival closed/ignored: " + winrt::to_string(ex.message()));
     } catch (const std::exception& e) {
         Logger::E("WGC", "Exception in OnFrameArrived: " + std::string(e.what()));
     } catch (...) {
         Logger::E("WGC", "Unknown exception in OnFrameArrived");
     }
 }
+

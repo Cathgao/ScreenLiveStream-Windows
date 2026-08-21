@@ -9,6 +9,7 @@
 #include <codecapi.h>
 #include <wrl/client.h>
 #include <vector>
+#include <unordered_map>
 #include <functional>
 #include <cstdint>
 #include <string>
@@ -65,30 +66,26 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VideoContext> m_videoContext;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessor> m_videoProcessor;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> m_videoProcessorEnum;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_nv12Texture;
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> m_inputView;
-    ID3D11Texture2D* m_lastBgraTexture = nullptr;
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> m_outputView;
+    static constexpr int NV12_RING_SIZE = 4;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_nv12Textures[NV12_RING_SIZE];
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> m_outputViews[NV12_RING_SIZE];
+    std::unordered_map<ID3D11Texture2D*, Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView>> m_inputViews;
+    uint32_t m_nv12RingIndex = 0;
 
     int m_width = 0;
     int m_height = 0;
     int m_fps = 60;
     int m_bitrateKbps = 16000;
     VideoCodecType m_codecType = VideoCodecType::H265_HEVC;
-    bool m_isInitialized = false;
+    std::atomic<bool> m_isInitialized{ false };
     bool m_forceKeyframe = true;
     uint32_t m_frameIndex = 0;
 
     EncodedCallback m_encodedCallback;
     std::vector<uint8_t> m_cachedConfigData;
-    std::mutex m_drainMutex;
-
-    Microsoft::WRL::ComPtr<IMFMediaEventGenerator> m_eventGenerator;
-    std::thread m_eventThread;
-    std::atomic<bool> m_isEventThreadRunning{ false };
-    void EventThreadProc();
+    std::mutex m_encoderMutex;
 
     bool InitColorConverter();
-    bool ConvertBgraToNv12(ID3D11Texture2D* bgraTexture);
+    bool ConvertBgraToNv12(ID3D11Texture2D* bgraTexture, ID3D11Texture2D** outNv12Texture);
     void DrainOutput(int64_t timestampMs);
 };

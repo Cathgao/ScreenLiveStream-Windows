@@ -20,17 +20,9 @@ WmfVideoEncoder::~WmfVideoEncoder() {
 }
 
 void WmfVideoEncoder::Shutdown() {
-    m_isEventThreadRunning = false;
-    if (m_eventGenerator) {
-        Microsoft::WRL::ComPtr<IMFShutdown> shutdown;
-        if (SUCCEEDED(m_eventGenerator.As(&shutdown)) && shutdown) {
-            shutdown->Shutdown();
-        }
-    }
-    if (m_eventThread.joinable()) {
-        m_eventThread.join();
-    }
-    m_eventGenerator = nullptr;
+    m_isInitialized = false;
+
+    std::lock_guard<std::mutex> lock(m_encoderMutex);
 
     if (m_encoder) {
         m_encoder->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
@@ -38,16 +30,18 @@ void WmfVideoEncoder::Shutdown() {
         m_encoder = nullptr;
     }
     m_codecApi = nullptr;
-    m_outputView = nullptr;
-    m_inputView = nullptr;
-    m_lastBgraTexture = nullptr;
+    for (int i = 0; i < NV12_RING_SIZE; ++i) {
+        m_outputViews[i] = nullptr;
+        m_nv12Textures[i] = nullptr;
+    }
+    m_inputViews.clear();
     m_videoProcessor = nullptr;
     m_videoProcessorEnum = nullptr;
     m_videoContext = nullptr;
     m_videoDevice = nullptr;
-    m_nv12Texture = nullptr;
-    m_isInitialized = false;
     m_cachedConfigData.clear();
+    m_encodedCallback = nullptr;
+    m_nv12RingIndex = 0;
     Logger::I("WmfVideoEncoder", "Encoder shutdown complete.");
 }
 
@@ -67,27 +61,6 @@ bool WmfVideoEncoder::InitColorConverter() {
     if (FAILED(hr)) {
         Logger::E("WmfVideoEncoder", "Failed to query ID3D11VideoContext, hr = 0x" + std::to_string(hr));
         return false;
-    }
-
-    D3D11_TEXTURE2D_DESC nv12Desc = {};
-    nv12Desc.Width = m_width;
-    nv12Desc.Height = m_height;
-    nv12Desc.MipLevels = 1;
-    nv12Desc.ArraySize = 1;
-    nv12Desc.Format = DXGI_FORMAT_NV12;
-    nv12Desc.SampleDesc.Count = 1;
-    nv12Desc.Usage = D3D11_USAGE_DEFAULT;
-    nv12Desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    nv12Desc.MiscFlags = 0;
-
-    hr = m_device->CreateTexture2D(&nv12Desc, nullptr, &m_nv12Texture);
-    if (FAILED(hr)) {
-        nv12Desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-        hr = m_device->CreateTexture2D(&nv12Desc, nullptr, &m_nv12Texture);
-        if (FAILED(hr)) {
-            Logger::E("WmfVideoEncoder", "Failed to create NV12 texture, hr = 0x" + std::to_string(hr));
-            return false;
-        }
     }
 
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC contentDesc = {};
@@ -110,31 +83,59 @@ bool WmfVideoEncoder::InitColorConverter() {
         return false;
     }
 
+    D3D11_TEXTURE2D_DESC nv12Desc = {};
+    nv12Desc.Width = m_width;
+    nv12Desc.Height = m_height;
+    nv12Desc.MipLevels = 1;
+    nv12Desc.ArraySize = 1;
+    nv12Desc.Format = DXGI_FORMAT_NV12;
+    nv12Desc.SampleDesc.Count = 1;
+    nv12Desc.Usage = D3D11_USAGE_DEFAULT;
+    nv12Desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    nv12Desc.MiscFlags = 0;
+
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outViewDesc = {};
     outViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
     outViewDesc.Texture2D.MipSlice = 0;
-    hr = m_videoDevice->CreateVideoProcessorOutputView(m_nv12Texture.Get(), m_videoProcessorEnum.Get(), &outViewDesc, &m_outputView);
-    if (FAILED(hr)) {
-        Logger::E("WmfVideoEncoder", "Failed to create VideoProcessorOutputView, hr = 0x" + std::to_string(hr));
-        return false;
+
+    for (int i = 0; i < NV12_RING_SIZE; ++i) {
+        hr = m_device->CreateTexture2D(&nv12Desc, nullptr, &m_nv12Textures[i]);
+        if (FAILED(hr)) {
+            nv12Desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+            hr = m_device->CreateTexture2D(&nv12Desc, nullptr, &m_nv12Textures[i]);
+            if (FAILED(hr)) {
+                Logger::E("WmfVideoEncoder", "Failed to create NV12 texture [" + std::to_string(i) + "], hr = 0x" + std::to_string(hr));
+                return false;
+            }
+        }
+
+        hr = m_videoDevice->CreateVideoProcessorOutputView(m_nv12Textures[i].Get(), m_videoProcessorEnum.Get(), &outViewDesc, &m_outputViews[i]);
+        if (FAILED(hr)) {
+            Logger::E("WmfVideoEncoder", "Failed to create VideoProcessorOutputView [" + std::to_string(i) + "], hr = 0x" + std::to_string(hr));
+            return false;
+        }
     }
 
-    m_inputView = nullptr;
-    m_lastBgraTexture = nullptr;
+    m_inputViews.clear();
+    m_nv12RingIndex = 0;
     return true;
 }
 
-bool WmfVideoEncoder::ConvertBgraToNv12(ID3D11Texture2D* bgraTexture) {
-    if (!bgraTexture || !m_videoContext || !m_videoProcessor || !m_outputView) return false;
+bool WmfVideoEncoder::ConvertBgraToNv12(ID3D11Texture2D* bgraTexture, ID3D11Texture2D** outNv12Texture) {
+    if (!bgraTexture || !m_videoDevice || !m_videoContext || !m_videoProcessor || !outNv12Texture) return false;
 
-    if (!m_inputView || m_lastBgraTexture != bgraTexture) {
+    int ringIdx = (m_nv12RingIndex++) % NV12_RING_SIZE;
+    if (!m_outputViews[ringIdx] || !m_nv12Textures[ringIdx]) return false;
+
+    auto it = m_inputViews.find(bgraTexture);
+    if (it == m_inputViews.end() || !it->second) {
         D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inViewDesc = {};
         inViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
         inViewDesc.Texture2D.MipSlice = 0;
         inViewDesc.Texture2D.ArraySlice = 0;
 
-        m_inputView = nullptr;
-        HRESULT hr = m_videoDevice->CreateVideoProcessorInputView(bgraTexture, m_videoProcessorEnum.Get(), &inViewDesc, &m_inputView);
+        Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> inputView;
+        HRESULT hr = m_videoDevice->CreateVideoProcessorInputView(bgraTexture, m_videoProcessorEnum.Get(), &inViewDesc, &inputView);
         if (FAILED(hr)) {
             static int s_err1 = 0;
             if (s_err1++ < 3) {
@@ -142,14 +143,15 @@ bool WmfVideoEncoder::ConvertBgraToNv12(ID3D11Texture2D* bgraTexture) {
             }
             return false;
         }
-        m_lastBgraTexture = bgraTexture;
+        m_inputViews[bgraTexture] = inputView;
+        it = m_inputViews.find(bgraTexture);
     }
 
     D3D11_VIDEO_PROCESSOR_STREAM stream = {};
     stream.Enable = TRUE;
-    stream.pInputSurface = m_inputView.Get();
+    stream.pInputSurface = it->second.Get();
 
-    HRESULT hr = m_videoContext->VideoProcessorBlt(m_videoProcessor.Get(), m_outputView.Get(), 0, 1, &stream);
+    HRESULT hr = m_videoContext->VideoProcessorBlt(m_videoProcessor.Get(), m_outputViews[ringIdx].Get(), 0, 1, &stream);
     if (FAILED(hr)) {
         static int s_err2 = 0;
         if (s_err2++ < 3) {
@@ -157,6 +159,8 @@ bool WmfVideoEncoder::ConvertBgraToNv12(ID3D11Texture2D* bgraTexture) {
         }
         return false;
     }
+
+    *outNv12Texture = m_nv12Textures[ringIdx].Get();
     return true;
 }
 
@@ -276,7 +280,7 @@ static bool TrySetupEncoder(
         }
     }
 
-    // 3. Low-latency tuning
+    // 3. Low-latency & Real-Time High-FPS tuning
     if (SUCCEEDED(encoder->QueryInterface(IID_PPV_ARGS(&outCodecApi))) && outCodecApi) {
         VARIANT val;
         VariantInit(&val);
@@ -288,6 +292,14 @@ static bool TrySetupEncoder(
         val.vt = VT_BOOL;
         val.boolVal = VARIANT_TRUE;
         outCodecApi->SetValue(&CODECAPI_AVEncCommonLowLatency, &val);
+
+        val.vt = VT_BOOL;
+        val.boolVal = VARIANT_TRUE;
+        outCodecApi->SetValue(&CODECAPI_AVEncCommonRealTime, &val);
+
+        val.vt = VT_UI4;
+        val.ulVal = 100; // 100 = QualityVsSpeed Fastest
+        outCodecApi->SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &val);
 
         val.vt = VT_UI4;
         val.ulVal = fps > 0 ? fps : 60;
@@ -377,7 +389,7 @@ bool WmfVideoEncoder::Initialize(
             Microsoft::WRL::ComPtr<IMFTransform> encoder;
             hr = ppActivate[i]->ActivateObject(IID_PPV_ARGS(&encoder));
             if (SUCCEEDED(hr) && encoder) {
-                if (TrySetupEncoder(encoder.Get(), m_dxgiManager.Get(), m_nv12Texture.Get(), subtype, m_width, m_height, m_fps, m_bitrateKbps, m_codecApi)) {
+                if (TrySetupEncoder(encoder.Get(), m_dxgiManager.Get(), m_nv12Textures[0].Get(), subtype, m_width, m_height, m_fps, m_bitrateKbps, m_codecApi)) {
                     m_encoder = encoder;
                     Logger::I("WmfVideoEncoder", "Successfully activated verified encoder: " + std::string(szName));
                     for (UINT32 j = 0; j < count; ++j) ppActivate[j]->Release();
@@ -401,11 +413,6 @@ bool WmfVideoEncoder::Initialize(
         m_isInitialized = true;
         m_forceKeyframe = true;
         m_frameIndex = 0;
-        if (SUCCEEDED(m_encoder.As(&m_eventGenerator)) && m_eventGenerator) {
-            m_isEventThreadRunning = true;
-            m_eventThread = std::thread(&WmfVideoEncoder::EventThreadProc, this);
-            Logger::I("WmfVideoEncoder", "Asynchronous MFT Event Generator thread started.");
-        }
         return true;
     }
 
@@ -417,11 +424,6 @@ bool WmfVideoEncoder::Initialize(
             m_isInitialized = true;
             m_forceKeyframe = true;
             m_frameIndex = 0;
-            if (SUCCEEDED(m_encoder.As(&m_eventGenerator)) && m_eventGenerator) {
-                m_isEventThreadRunning = true;
-                m_eventThread = std::thread(&WmfVideoEncoder::EventThreadProc, this);
-                Logger::I("WmfVideoEncoder", "Asynchronous MFT Event Generator thread started.");
-            }
             Logger::I("WmfVideoEncoder", "Fallback to H.264 successful.");
             return true;
         }
@@ -435,35 +437,18 @@ void WmfVideoEncoder::RequestKeyFrame() {
     m_forceKeyframe = true;
 }
 
-void WmfVideoEncoder::EventThreadProc() {
-    Logger::I("WmfVideoEncoder", "Asynchronous MFT Event thread running.");
-    while (m_isEventThreadRunning && m_eventGenerator) {
-        Microsoft::WRL::ComPtr<IMFMediaEvent> pEvent;
-        HRESULT hr = m_eventGenerator->GetEvent(0, &pEvent);
-        if (FAILED(hr) || !pEvent) {
-            if (!m_isEventThreadRunning) break;
-            continue;
-        }
-
-        MediaEventType eventType = MEUnknown;
-        pEvent->GetType(&eventType);
-
-        if (eventType == METransformHaveOutput) {
-            int64_t nowMs = Protocol::GetCurrentMillis();
-            DrainOutput(nowMs);
-        }
-    }
-    Logger::I("WmfVideoEncoder", "Asynchronous MFT Event thread stopped.");
-}
-
 bool WmfVideoEncoder::EncodeFrame(ID3D11Texture2D* bgraTexture, int64_t timestampNs) {
+    if (!m_isInitialized || !bgraTexture) return false;
+
+    std::lock_guard<std::mutex> lock(m_encoderMutex);
     if (!m_isInitialized || !m_encoder || !bgraTexture) return false;
 
-    if (!ConvertBgraToNv12(bgraTexture)) {
+    ID3D11Texture2D* targetNv12 = nullptr;
+    if (!ConvertBgraToNv12(bgraTexture, &targetNv12) || !targetNv12) {
         return false;
     }
 
-    bool forceThisFrame = m_forceKeyframe || (m_frameIndex <= 15) || (m_frameIndex % (m_fps > 0 ? m_fps : 60) == 0);
+    bool forceThisFrame = m_forceKeyframe || (m_frameIndex <= 5) || (m_frameIndex % (m_fps > 0 ? m_fps : 60) == 0);
     if (forceThisFrame && m_codecApi) {
         VARIANT val;
         VariantInit(&val);
@@ -474,7 +459,7 @@ bool WmfVideoEncoder::EncodeFrame(ID3D11Texture2D* bgraTexture, int64_t timestam
     }
 
     Microsoft::WRL::ComPtr<IMFMediaBuffer> mediaBuffer;
-    HRESULT hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), m_nv12Texture.Get(), 0, FALSE, &mediaBuffer);
+    HRESULT hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), targetNv12, 0, FALSE, &mediaBuffer);
     if (FAILED(hr)) return false;
 
     Microsoft::WRL::ComPtr<IMFSample> sample;
@@ -502,8 +487,6 @@ bool WmfVideoEncoder::EncodeFrame(ID3D11Texture2D* bgraTexture, int64_t timestam
 
 void WmfVideoEncoder::DrainOutput(int64_t timestampMs) {
     if (!m_encoder) return;
-
-    std::lock_guard<std::mutex> lock(m_drainMutex);
 
     MFT_OUTPUT_STREAM_INFO streamInfo = {};
     HRESULT hrInfo = m_encoder->GetOutputStreamInfo(0, &streamInfo);

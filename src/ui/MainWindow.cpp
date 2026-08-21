@@ -223,6 +223,7 @@ void MainWindow::InitControls() {
     SendMessage(m_comboFps, CB_ADDSTRING, 0, (LPARAM)L"60 FPS");
     SendMessage(m_comboFps, CB_ADDSTRING, 0, (LPARAM)L"90 FPS");
     SendMessage(m_comboFps, CB_ADDSTRING, 0, (LPARAM)L"120 FPS");
+    SendMessage(m_comboFps, CB_ADDSTRING, 0, (LPARAM)L"144 FPS");
     SendMessage(m_comboFps, CB_SETCURSEL, 0, 0);
     SendMessage(m_comboFps, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
     SetWindowTheme(m_comboFps, L"DarkMode_Explorer", nullptr);
@@ -430,8 +431,8 @@ bool MainWindow::StartSender() {
     int bitrateKbps = bitrates[bitrateIdx >= 0 && bitrateIdx < 4 ? bitrateIdx : 1];
 
     int fpsIdx = (int)SendMessage(m_comboFps, CB_GETCURSEL, 0, 0);
-    int fpsList[] = { 60, 90, 120 };
-    int fps = fpsList[fpsIdx >= 0 && fpsIdx < 3 ? fpsIdx : 0];
+    int fpsList[] = { 60, 90, 120, 144 };
+    int fps = fpsList[fpsIdx >= 0 && fpsIdx < 4 ? fpsIdx : 0];
 
     int protoIdx = (int)SendMessage(m_comboProtocol, CB_GETCURSEL, 0, 0);
     bool isUdp = (protoIdx == 0);
@@ -461,6 +462,7 @@ bool MainWindow::StartSender() {
         m_audioEncoder = std::make_unique<WmfAudioEncoder>();
         m_audioEncoder->Initialize(48000, 2, 128000);
         m_audioEncoder->SetEncodedCallback([this](const uint8_t* data, size_t size, int64_t timestampMs) {
+            if (!m_isStreaming) return;
             if (m_udpStreamer && m_udpStreamer->IsRunning()) {
                 m_udpStreamer->SendFrame(data, size, timestampMs, false, false, false, true);
             } else if (m_tcpStreamer && m_tcpStreamer->IsConnected()) {
@@ -470,6 +472,7 @@ bool MainWindow::StartSender() {
 
         m_wasapiCapture = std::make_unique<WasapiCapture>();
         m_wasapiCapture->SetAudioCallback([this](const uint8_t* pcm, size_t bytes, int64_t tsNs) {
+            if (!m_isStreaming) return;
             if (m_audioEncoder && m_audioEncoder->IsInitialized()) {
                 m_audioEncoder->EncodePcm(pcm, bytes, tsNs);
             }
@@ -496,6 +499,7 @@ bool MainWindow::StartSender() {
     }
 
     m_videoEncoder->SetEncodedCallback([this](const uint8_t* data, size_t size, int64_t timestampMs, bool isKeyframe, bool isCodecConfig, bool isHevc) {
+        if (!m_isStreaming) return;
         m_fpsCounter.fetch_add(1);
         if (m_udpStreamer && m_udpStreamer->IsRunning()) {
             m_udpStreamer->SendFrame(data, size, timestampMs, isKeyframe, isCodecConfig, isHevc, false);
@@ -507,6 +511,7 @@ bool MainWindow::StartSender() {
     // 4. Init WGC Capture
     m_wgcCapture = std::make_unique<WgcCapture>(m_d3dResources.device.Get());
     m_wgcCapture->SetFrameCallback([this](ID3D11Texture2D* texture, int64_t tsNs, int w, int h) {
+        if (!m_isStreaming) return;
         m_statWidth = w;
         m_statHeight = h;
         if (m_videoEncoder && m_videoEncoder->IsInitialized()) {
