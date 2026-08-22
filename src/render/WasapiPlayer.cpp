@@ -24,7 +24,8 @@ bool WasapiPlayer::Start(int sampleRate, int channels) {
 
     m_sampleRate = (sampleRate > 0) ? sampleRate : 48000;
     m_channels = (channels > 0) ? channels : 2;
-    m_prebufferSamples = static_cast<size_t>((m_sampleRate * m_channels * 15) / 1000); // 15ms minimal hardware prebuffer
+    size_t prebufferMs = m_isLowLatencyMode.load(std::memory_order_relaxed) ? 35 : 2000;
+    m_prebufferSamples = static_cast<size_t>((m_sampleRate * m_channels * prebufferMs) / 1000);
     m_prebuffering = true;
     m_currentAudioPtsMs.store(-1, std::memory_order_relaxed);
     m_lastAudioPtsLocalTimeMs.store(0, std::memory_order_relaxed);
@@ -65,6 +66,72 @@ int64_t WasapiPlayer::GetCurrentRenderedAudioPtsMs() const {
     return basePts + elapsed;
 }
 
+void WasapiPlayer::AlignToAnchorPts(int64_t anchorPtsMs) {
+    if (anchorPtsMs < 0) return;
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    m_prebuffering = false;
+
+    // Drop audio segments prior to anchorPtsMs to ensure video & audio start simultaneously at the same PTS
+    size_t dropSamples = 0;
+    while (!m_ptsSegments.empty() && (m_ptsSegments.front().ptsMs + 30 < anchorPtsMs)) {
+        dropSamples += m_ptsSegments.front().sampleCount;
+        m_ptsSegments.pop_front();
+    }
+
+    if (dropSamples > 0) {
+        m_queueReadOffset = std::min(m_pcmQueue.size(), m_queueReadOffset + dropSamples);
+        if (m_queueReadOffset >= m_pcmQueue.size()) {
+            m_pcmQueue.clear();
+            m_queueReadOffset = 0;
+        }
+        Logger::I("WasapiPlayer", "[AV_ALIGN] Aligned audio queue to anchorPts=" + std::to_string(anchorPtsMs) +
+                  " (dropped " + std::to_string(dropSamples) + " pre-anchor samples)");
+    }
+}
+
+void WasapiPlayer::SyncWithVideoPts(int64_t videoPtsMs) {
+    if (!m_isPlaying.load(std::memory_order_relaxed) || videoPtsMs < 0) return;
+
+    int64_t audioPts = GetCurrentRenderedAudioPtsMs();
+    if (audioPts < 0) return;
+
+    bool isLowLatency = m_isLowLatencyMode.load(std::memory_order_relaxed);
+    // In low-latency mode, video takes ~30ms to reach screen through D3D11 swapchain/VSync,
+    // so audio target PTS at speaker should be videoPtsMs - 30ms.
+    int64_t targetAudioPts = isLowLatency ? (videoPtsMs - 30) : videoPtsMs;
+    int64_t diffMs = audioPts - targetAudioPts;
+
+    // If audio is lagging behind video (diffMs < -70ms in large buffer or < -80ms in low latency)
+    if (diffMs < -70) {
+        int64_t catchUpMs = -diffMs - 20; // catch up most of the gap smoothly
+        size_t skipSamples = static_cast<size_t>((m_sampleRate * m_channels * catchUpMs) / 1000);
+
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        size_t available = (m_pcmQueue.size() > m_queueReadOffset) ? (m_pcmQueue.size() - m_queueReadOffset) : 0;
+        size_t actualSkip = std::min(available, skipSamples);
+        if (actualSkip > 0) {
+            m_queueReadOffset += actualSkip;
+            size_t rem = actualSkip;
+            while (rem > 0 && !m_ptsSegments.empty()) {
+                if (m_ptsSegments.front().sampleCount <= rem) {
+                    rem -= m_ptsSegments.front().sampleCount;
+                    m_ptsSegments.pop_front();
+                } else {
+                    m_ptsSegments.front().sampleCount -= rem;
+                    m_ptsSegments.front().ptsMs += static_cast<int64_t>((rem * 1000.0) / (m_sampleRate * m_channels));
+                    rem = 0;
+                }
+            }
+            if (m_queueReadOffset >= m_pcmQueue.size()) {
+                m_pcmQueue.clear();
+                m_queueReadOffset = 0;
+            }
+            Logger::W("WasapiPlayer", "[AV_SYNC] Audio lagging behind video by " + std::to_string(-diffMs) +
+                      " ms. Fast-forwarded " + std::to_string(actualSkip) + " samples (~" + std::to_string(catchUpMs) + " ms)");
+        }
+    }
+}
+
 void WasapiPlayer::PushPcm(const uint8_t* pcmData, size_t bytes, int64_t timestampMs) {
     if (!m_isPlaying.load(std::memory_order_relaxed) || !pcmData || bytes < sizeof(int16_t)) return;
 
@@ -80,16 +147,19 @@ void WasapiPlayer::PushPcm(const uint8_t* pcmData, size_t bytes, int64_t timesta
         m_queueReadOffset = 0;
     }
 
-    // Low latency audio buffer cap (~150ms, approx 7 AAC frames) to handle network packet bursts without jitter
-    size_t maxBacklog = static_cast<size_t>((m_sampleRate * m_channels * 150) / 1000);
+    // Audio buffer cap (90ms in low latency, 2500ms in large buffer mode)
+    bool isLowLatency = m_isLowLatencyMode.load(std::memory_order_relaxed);
+    size_t maxBacklogMs = isLowLatency ? 90 : 2500;
+    size_t maxBacklog = static_cast<size_t>((m_sampleRate * m_channels * maxBacklogMs) / 1000);
     size_t activeSamples = m_pcmQueue.size() - m_queueReadOffset;
     if (activeSamples > maxBacklog) {
         m_statsPruneEvents++;
-        size_t targetActive = static_cast<size_t>((m_sampleRate * m_channels * 40) / 1000);
+        size_t targetActiveMs = isLowLatency ? 35 : 2000;
+        size_t targetActive = static_cast<size_t>((m_sampleRate * m_channels * targetActiveMs) / 1000);
         size_t pruneCount = (m_pcmQueue.size() > targetActive) ? (m_pcmQueue.size() - targetActive - m_queueReadOffset) : 0;
         int64_t prunedMs = static_cast<int64_t>((pruneCount * 1000.0) / (m_sampleRate * m_channels));
         Logger::W("WasapiPlayer", "[AUDIO_PRUNE] Backlog reached " + std::to_string(activeSamples * 1000 / (m_sampleRate * m_channels)) +
-                  " ms (>150ms max). Pruning " + std::to_string(pruneCount) + " samples (~" + std::to_string(prunedMs) +
+                  " ms (>" + std::to_string(maxBacklogMs) + "ms max). Pruning " + std::to_string(pruneCount) + " samples (~" + std::to_string(prunedMs) +
                   " ms) to avoid audio latency accumulation");
 
         m_queueReadOffset = (m_pcmQueue.size() > targetActive) ? (m_pcmQueue.size() - targetActive) : 0;

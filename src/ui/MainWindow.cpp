@@ -29,6 +29,7 @@
 #define ID_BTN_ACTION 2014
 #define ID_BTN_REFRESH_DEVICES 2015
 #define ID_COMBO_RATE_CONTROL 2016
+#define ID_CHK_LOW_LATENCY 2017
 
 #define WM_USER_DEVICES_UPDATED (WM_USER + 1)
 #define WM_USER_ADAPT_WINDOW (WM_USER + 2)
@@ -245,6 +246,11 @@ void MainWindow::InitControls() {
     SendMessage(m_chkAudio, BM_SETCHECK, BST_CHECKED, 0);
     SendMessage(m_chkCursor, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
     SendMessage(m_chkAudio, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
+
+    // Receiver Mode Low Latency Toggle (Unchecked by default -> uses 2000ms large buffer)
+    m_chkLowLatency = CreateWindowExW(0, L"BUTTON", L"低延迟模式 (可能会有卡顿)", WS_CHILD | BS_AUTOCHECKBOX, 34, 130, 470, 24, m_hwnd, (HMENU)ID_CHK_LOW_LATENCY, m_hInstance, nullptr);
+    SendMessage(m_chkLowLatency, BM_SETCHECK, BST_UNCHECKED, 0);
+    SendMessage(m_chkLowLatency, WM_SETFONT, (WPARAM)m_hFontNormal, TRUE);
 
     // Action Hero Button (Owner-draw)
     m_btnAction = CreateWindowExW(0, L"BUTTON", L"启动画面投屏", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 20, 504, 504, 46, m_hwnd, (HMENU)ID_BTN_ACTION, m_hInstance, nullptr);
@@ -478,6 +484,7 @@ void MainWindow::UpdateUiMode() {
 
         SetWindowPos(m_chkCursor, nullptr, 34, 320, 210, 24, SWP_NOZORDER | SWP_SHOWWINDOW);
         SetWindowPos(m_chkAudio, nullptr, 274, 320, 246, 24, SWP_NOZORDER | SWP_SHOWWINDOW);
+        ShowWindow(m_chkLowLatency, SW_HIDE);
 
         SetWindowPos(m_btnAction, nullptr, 20, 504, 504, 46, SWP_NOZORDER | SWP_SHOWWINDOW);
 
@@ -525,10 +532,15 @@ void MainWindow::UpdateUiMode() {
         SetWindowPos(m_lblProtocol, nullptr, 274, 100, 75, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
         SetWindowTextW(m_lblProtocol, L"传输协议:");
         SetWindowPos(m_comboProtocol, nullptr, 354, 96, 166, 140, SWP_NOZORDER | SWP_SHOWWINDOW);
+
+        SetWindowPos(m_chkLowLatency, nullptr, 34, 130, 470, 24, SWP_NOZORDER | SWP_SHOWWINDOW);
+        ShowWindow(m_chkLowLatency, SW_SHOW);
+
         SetWindowPos(m_btnAction, nullptr, 20, 412, 504, 46, SWP_NOZORDER | SWP_SHOWWINDOW);
 
         EnableWindow(m_editPort, !m_isReceiving);
         EnableWindow(m_comboProtocol, !m_isReceiving);
+        EnableWindow(m_chkLowLatency, !m_isReceiving);
     }
 
     if (m_hwnd) {
@@ -818,27 +830,123 @@ void MainWindow::AutoAdaptReceiverWindow(int videoW, int videoH) {
 
 void MainWindow::ReceiverDecodeLoop() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    Logger::I("MainWindow", "Receiver Decode Loop thread started (Ultra Low-Latency Direct Pipeline).");
+    bool isLowLatency = m_isLowLatencyMode.load(std::memory_order_relaxed);
+    Logger::I("MainWindow", "Receiver Decode Loop thread started (" +
+              std::string(isLowLatency ? "Ultra Low-Latency Direct Pipeline" : "2000ms Large Jitter Buffer Pipeline") + ").");
+
+    bool isPrebuffering = !isLowLatency;
+    std::chrono::steady_clock::time_point anchorWallTime;
+    int64_t anchorPtsMs = -1;
 
     while (m_isDecoding) {
         ReceiverVideoPacket pkt;
         {
             std::unique_lock<std::mutex> lock(m_frameQueueMutex);
-            m_frameQueueCv.wait(lock, [this] {
-                return !m_isDecoding || !m_frameQueue.empty();
-            });
+            if (!isLowLatency && isPrebuffering) {
+                // Wait until queue accumulates ~2000ms of data or stream stops
+                m_frameQueueCv.wait(lock, [this] {
+                    if (!m_isDecoding) return true;
+                    if (m_frameQueue.empty()) return false;
+                    int64_t spanMs = m_frameQueue.back().timestampMs - m_frameQueue.front().timestampMs;
+                    return (spanMs >= 2000) || (m_frameQueue.size() >= 140);
+                });
 
-            if (!m_isDecoding) break;
+                if (!m_isDecoding) break;
+                if (!m_frameQueue.empty()) {
+                    isPrebuffering = false;
+                    anchorWallTime = std::chrono::steady_clock::now();
+                    anchorPtsMs = m_frameQueue.front().timestampMs;
+                    if (m_wasapiPlayer) {
+                        m_wasapiPlayer->AlignToAnchorPts(anchorPtsMs);
+                    }
+                    Logger::I("MainWindow", "Pre-buffering complete (" + std::to_string(m_frameQueue.size()) +
+                              " frames in queue). Starting 2000ms smooth paced playback.");
+                }
+            } else {
+                m_frameQueueCv.wait(lock, [this] {
+                    return !m_isDecoding || !m_frameQueue.empty();
+                });
+                if (!m_isDecoding) break;
+            }
 
-            pkt = std::move(m_frameQueue.front());
-            m_frameQueue.pop_front();
+            if (m_frameQueue.empty()) continue;
+
+            if (isLowLatency) {
+                pkt = std::move(m_frameQueue.front());
+                m_frameQueue.pop_front();
+            } else {
+                // Paced release based on timestampMs
+                const auto& frontPkt = m_frameQueue.front();
+                if (frontPkt.isCodecConfig) {
+                    pkt = std::move(m_frameQueue.front());
+                    m_frameQueue.pop_front();
+                } else {
+                    if (anchorPtsMs < 0) {
+                        anchorPtsMs = frontPkt.timestampMs;
+                        anchorWallTime = std::chrono::steady_clock::now();
+                        if (m_wasapiPlayer) {
+                            m_wasapiPlayer->AlignToAnchorPts(anchorPtsMs);
+                        }
+                    }
+
+                    int64_t relPtsMs = frontPkt.timestampMs - anchorPtsMs;
+                    if (relPtsMs < 0 || relPtsMs > 3600000) {
+                        // Timestamp wrap or reset -> re-anchor
+                        anchorPtsMs = frontPkt.timestampMs;
+                        anchorWallTime = std::chrono::steady_clock::now();
+                        if (m_wasapiPlayer) {
+                            m_wasapiPlayer->AlignToAnchorPts(anchorPtsMs);
+                        }
+                        relPtsMs = 0;
+                    }
+
+                    auto targetWallTime = anchorWallTime + std::chrono::milliseconds(relPtsMs);
+
+                    while (m_isDecoding) {
+                        auto now = std::chrono::steady_clock::now();
+                        if (targetWallTime <= now) {
+                            // Target presentation time reached -> proceed to pop and render
+                            break;
+                        }
+
+                        auto waitDur = targetWallTime - now;
+                        if (waitDur > std::chrono::milliseconds(3000)) {
+                            // Large forward jump / drift -> re-anchor
+                            anchorWallTime = now;
+                            anchorPtsMs = frontPkt.timestampMs;
+                            if (m_wasapiPlayer) {
+                                m_wasapiPlayer->AlignToAnchorPts(anchorPtsMs);
+                            }
+                            break;
+                        }
+
+                        // Wait for remaining duration without popping prematurely on incoming packet notifications
+                        m_frameQueueCv.wait_for(lock, waitDur);
+                    }
+
+                    if (!m_isDecoding) break;
+
+                    auto now = std::chrono::steady_clock::now();
+                    if (now > targetWallTime + std::chrono::milliseconds(2500)) {
+                        // Falling behind -> catch up smoothly
+                        anchorWallTime = now - std::chrono::milliseconds(relPtsMs);
+                    }
+
+                    if (m_frameQueue.empty()) {
+                        isPrebuffering = true;
+                        continue;
+                    }
+                    pkt = std::move(m_frameQueue.front());
+                    m_frameQueue.pop_front();
+                }
+            }
         }
 
         if (!m_videoDecoder || pkt.data.empty()) continue;
 
         double queueWaitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pkt.enqueueTime).count();
         m_statsTotalQueueDelayMs.store(m_statsTotalQueueDelayMs.load() + queueWaitMs);
-        if (queueWaitMs > 30.0) {
+        if (isLowLatency && queueWaitMs > 30.0) {
             Logger::W("MainWindow", "[QUEUE_DELAY] Packet waited " + std::to_string(queueWaitMs) +
                       " ms in queue before decode (timestampMs=" + std::to_string(pkt.timestampMs) + ", isKey=" + std::to_string(pkt.isKeyframe) + ")");
         }
@@ -846,6 +954,10 @@ void MainWindow::ReceiverDecodeLoop() {
         VideoCodecType targetCodec = pkt.isHevc ? VideoCodecType::H265_HEVC : VideoCodecType::H264;
         if (m_videoDecoder->GetCodecType() != targetCodec) {
             m_videoDecoder->Initialize(targetCodec);
+        }
+
+        if (m_wasapiPlayer && pkt.timestampMs >= 0) {
+            m_wasapiPlayer->SyncWithVideoPts(pkt.timestampMs);
         }
 
         // Direct Presentation: Always render immediately as soon as decoded
@@ -864,20 +976,20 @@ bool MainWindow::StartReceiver() {
     int protoIdx = (int)SendMessage(m_comboProtocol, CB_GETCURSEL, 0, 0);
     bool isUdp = (protoIdx == 0);
 
+    bool lowLatency = (SendMessage(m_chkLowLatency, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    m_isLowLatencyMode.store(lowLatency);
+
     CreateReceiverWindow();
 
     // Reset Engine Telemetry Stats
     m_statsQueueEnqueued = 0;
     m_statsQueueDrops = 0;
     m_statsRenderedFrames = 0;
-    m_statsSkippedFramesAvSync = 0;
-    m_statsSkippedFramesVideoSync = 0;
-    m_statsSleepWaitCount = 0;
-    m_statsTotalSleepWaitMs = 0;
     m_statsTotalQueueDelayMs.store(0.0);
 
     // 1. Audio Decoder & Player
     m_wasapiPlayer = std::make_unique<WasapiPlayer>();
+    m_wasapiPlayer->SetLowLatencyMode(lowLatency);
     m_wasapiPlayer->Start(48000, 2);
 
     m_audioDecoder = std::make_unique<WmfAudioDecoder>();
@@ -920,6 +1032,7 @@ bool MainWindow::StartReceiver() {
     // 4. Network Receiver
     if (isUdp) {
         m_udpReceiver = std::make_unique<UdpReceiver>();
+        m_udpReceiver->SetLowLatencyMode(lowLatency);
         m_udpReceiver->SetVideoCallback([this](const uint8_t* data, size_t size, int64_t ts, bool isKeyframe, bool isCodecConfig, bool isHevc) {
             if (!m_isReceiving || !m_isDecoding || !data || size == 0) return;
 
@@ -932,13 +1045,16 @@ bool MainWindow::StartReceiver() {
             pkt.enqueueTime = std::chrono::steady_clock::now();
             m_statsQueueEnqueued.fetch_add(1);
 
+            bool isLowLatency = m_isLowLatencyMode.load(std::memory_order_relaxed);
+            size_t dropThreshold = isLowLatency ? 2 : 200;
+
             {
                 std::lock_guard<std::mutex> lock(m_frameQueueMutex);
-                if (isKeyframe && m_frameQueue.size() > 2) {
+                if (isKeyframe && m_frameQueue.size() > dropThreshold) {
                     size_t dropped = m_frameQueue.size();
                     m_statsQueueDrops.fetch_add(static_cast<uint32_t>(dropped));
                     Logger::W("MainWindow", "[QUEUE_DROP] Keyframe received with " + std::to_string(dropped) +
-                              " backlogged frames. Clearing queue to reset latency!");
+                              " backlogged frames (limit=" + std::to_string(dropThreshold) + "). Clearing queue to reset latency!");
                     m_frameQueue.clear();
                 }
                 m_frameQueue.push_back(std::move(pkt));
@@ -969,13 +1085,16 @@ bool MainWindow::StartReceiver() {
             pkt.enqueueTime = std::chrono::steady_clock::now();
             m_statsQueueEnqueued.fetch_add(1);
 
+            bool isLowLatency = m_isLowLatencyMode.load(std::memory_order_relaxed);
+            size_t dropThreshold = isLowLatency ? 2 : 200;
+
             {
                 std::lock_guard<std::mutex> lock(m_frameQueueMutex);
-                if (isKeyframe && m_frameQueue.size() > 2) {
+                if (isKeyframe && m_frameQueue.size() > dropThreshold) {
                     size_t dropped = m_frameQueue.size();
                     m_statsQueueDrops.fetch_add(static_cast<uint32_t>(dropped));
                     Logger::W("MainWindow", "[QUEUE_DROP] Keyframe received with " + std::to_string(dropped) +
-                              " backlogged frames. Clearing queue to reset latency!");
+                              " backlogged frames (limit=" + std::to_string(dropThreshold) + "). Clearing queue to reset latency!");
                     m_frameQueue.clear();
                 }
                 m_frameQueue.push_back(std::move(pkt));
@@ -1175,34 +1294,33 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     DrawMetricBadge(400.0f, badgeY, badgeW, badgeH, L"当前码率", brStr);
                 } else {
                     // In Receiver Mode
-                    // 3. Card 1: 接收服务设置 (X: 20, Y: 66, W: 504, H: 136)
+                    // 3. Card 1: 接收服务设置 (X: 20, Y: 66, W: 504, H: 142)
                     Gdiplus::GraphicsPath card1Path;
-                    Gdiplus::RectF card1Rc(20.0f, 66.0f, 504.0f, 136.0f);
+                    Gdiplus::RectF card1Rc(20.0f, 66.0f, 504.0f, 142.0f);
                     AddRoundedRectToPath(card1Path, card1Rc, 8.0f);
                     g.FillPath(&cardBg, &card1Path);
                     g.DrawPath(&cardBorderPen, &card1Path);
                     g.DrawString(L"接收服务设置", -1, &headerFont, Gdiplus::PointF(34.0f, 74.0f), &textWhite);
 
                     // Guide tips in Card 1
-                    g.DrawString(L"• 启动后将在局域网自动广播本机 (Windows-PC) 接收服务", -1, &smallFont, Gdiplus::PointF(34.0f, 132.0f), &textMuted);
-                    g.DrawString(L"• 手机 / Quest 开启投屏 App 即可在设备列表中发现并一键连接", -1, &smallFont, Gdiplus::PointF(34.0f, 154.0f), &textMuted);
-                    g.DrawString(L"• 视频格式与码率由移动端决定，本机自动调用 D3D11VA 硬解加速", -1, &smallFont, Gdiplus::PointF(34.0f, 176.0f), &textMuted);
+                    g.DrawString(L"• 启动后将在局域网自动广播本机 (Windows-PC) 接收服务", -1, &smallFont, Gdiplus::PointF(34.0f, 160.0f), &textMuted);
+                    g.DrawString(L"• 移动端打开 App 即可发现并一键连接", -1, &smallFont, Gdiplus::PointF(34.0f, 180.0f), &textMuted);
 
-                    // 4. Card 2: 实时接收状态 (X: 20, Y: 210, W: 504, H: 186)
+                    // 4. Card 2: 实时接收状态 (X: 20, Y: 216, W: 504, H: 186)
                     Gdiplus::GraphicsPath card2Path;
-                    Gdiplus::RectF card2Rc(20.0f, 210.0f, 504.0f, 186.0f);
+                    Gdiplus::RectF card2Rc(20.0f, 216.0f, 504.0f, 186.0f);
                     AddRoundedRectToPath(card2Path, card2Rc, 8.0f);
                     g.FillPath(&cardBg, &card2Path);
                     g.DrawPath(&cardBorderPen, &card2Path);
-                    g.DrawString(L"实时接收状态", -1, &headerFont, Gdiplus::PointF(34.0f, 218.0f), &textWhite);
+                    g.DrawString(L"实时接收状态", -1, &headerFont, Gdiplus::PointF(34.0f, 224.0f), &textWhite);
 
                     bool isRunning = pThis->m_isReceiving.load();
                     Gdiplus::Color dotColor = isRunning ? Gdiplus::Color(255, 16, 185, 129) : Gdiplus::Color(255, 113, 113, 122);
                     Gdiplus::SolidBrush dotBrush(dotColor);
-                    g.FillEllipse(&dotBrush, 36.0f, 247.0f, 8.0f, 8.0f);
+                    g.FillEllipse(&dotBrush, 36.0f, 253.0f, 8.0f, 8.0f);
 
                     std::wstring statusStr = isRunning ? L"正在接收中 (FFmpeg D3D11VA 硬件加速解码)" : L"接收就绪 (Ready) - 启动接收端后，在移动端连接本机即可";
-                    g.DrawString(statusStr.c_str(), -1, &smallFont, Gdiplus::PointF(50.0f, 244.0f), isRunning ? &textWhite : &textMuted);
+                    g.DrawString(statusStr.c_str(), -1, &smallFont, Gdiplus::PointF(50.0f, 250.0f), isRunning ? &textWhite : &textMuted);
 
                     // 4 Metric Badges
                     auto DrawMetricBadge = [&](float bx, float by, float bw, float bh, const std::wstring& label, const std::wstring& val) {
@@ -1226,15 +1344,15 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
                     float badgeW = 114.0f;
                     float badgeH = 26.0f;
-                    float badgeY = 280.0f;
+                    float badgeY = 286.0f;
                     DrawMetricBadge(34.0f, badgeY, badgeW, badgeH, L"分辨率", resStr);
                     DrawMetricBadge(156.0f, badgeY, badgeW, badgeH, L"实时帧率", fpsStr);
                     DrawMetricBadge(278.0f, badgeY, badgeW, badgeH, L"往返延迟", rttStr);
                     DrawMetricBadge(400.0f, badgeY, badgeW, badgeH, L"当前码率", brStr);
 
                     // Pipeline info
-                    std::wstring pipeInfo = isRunning ? L"渲染管线: D3D11VA Texture -> SwapChain 直接呈现 | 音频: WASAPI 低延迟播放" : L"等待移动端连接推流中...";
-                    g.DrawString(pipeInfo.c_str(), -1, &smallFont, Gdiplus::PointF(34.0f, 320.0f), isRunning ? &textWhite : &textMuted);
+                    std::wstring pipeInfo = isRunning ? (pThis->m_isLowLatencyMode.load() ? L"渲染管线: D3D11VA 硬解 -> 极速直出 (~20ms) | 音频: WASAPI" : L"渲染管线: D3D11VA 硬解 -> 2000ms 抗抖大缓冲 | 音频: WASAPI") : L"等待移动端连接推流中...";
+                    g.DrawString(pipeInfo.c_str(), -1, &smallFont, Gdiplus::PointF(34.0f, 326.0f), isRunning ? &textWhite : &textMuted);
                 }
             }
 
@@ -1484,10 +1602,6 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     uint32_t enqueued = pThis->m_statsQueueEnqueued.exchange(0);
                     uint32_t drops = pThis->m_statsQueueDrops.exchange(0);
                     uint32_t rendered = pThis->m_statsRenderedFrames.exchange(0);
-                    uint32_t avSkips = pThis->m_statsSkippedFramesAvSync.exchange(0);
-                    uint32_t vidSkips = pThis->m_statsSkippedFramesVideoSync.exchange(0);
-                    uint32_t sleepCount = pThis->m_statsSleepWaitCount.exchange(0);
-                    int64_t sleepMs = pThis->m_statsTotalSleepWaitMs.exchange(0);
                     double totalQueueDelay = pThis->m_statsTotalQueueDelayMs.exchange(0.0);
                     double avgQueueDelay = enqueued > 0 ? (totalQueueDelay / enqueued) : 0.0;
                     size_t curQueueLen = 0;
@@ -1501,10 +1615,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     Logger::I("MainWindow", "[ENGINE_STATS 1s] Queue: " + std::to_string(curQueueLen) +
                               " frames (Enqueued: " + std::to_string(enqueued) + ", Drops: " + std::to_string(drops) +
                               ", AvgQueueDelay: " + std::to_string(avgQueueDelay) + " ms), Rendered: " +
-                              std::to_string(rendered) + " frames, RenderSkipped: " + std::to_string(avSkips + vidSkips) +
-                              " (AV-late: " + std::to_string(avSkips) + ", Video-late: " + std::to_string(vidSkips) +
-                              "), SyncSleep: " + std::to_string(sleepCount) + " times (total " + std::to_string(sleepMs) +
-                              " ms), AudioMasterPTS: " + std::to_string(audioPts) + " ms");
+                              std::to_string(rendered) + " frames, AudioMasterPTS: " + std::to_string(audioPts) + " ms");
                 } else {
                     pThis->m_statFps = 0;
                     pThis->m_statBitrateKbps = 0;

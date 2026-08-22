@@ -163,7 +163,6 @@ void UdpReceiver::ProcessUdpvPacket(const uint8_t* buffer, int length, const soc
                          (static_cast<uint32_t>(buffer[23]) << 8)  |
                           static_cast<uint32_t>(buffer[24]);
 
-    bool isKeyframe = (flags & 1) != 0;
     bool isFec = (flags & 8) != 0;
     bool isAudio = (flags & 16) != 0;
     bool isBeacon = (flags & 64) != 0;
@@ -352,9 +351,13 @@ void UdpReceiver::CheckAndAssembleUdpv(UdpvFrameBuffer& fb) {
 
 void UdpReceiver::CleanOldUdpvFrames(int32_t currentSeq) {
     auto now = std::chrono::steady_clock::now();
+    bool isLowLatency = m_isLowLatencyMode.load(std::memory_order_relaxed);
+    int maxSeqAge = isLowLatency ? 15 : 150;
+    int maxTimeAgeMs = isLowLatency ? 150 : 2000;
+
     for (auto it = m_udpvBuffers.begin(); it != m_udpvBuffers.end();) {
         auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.lastUpdate).count();
-        if (it->first < currentSeq - 15 || ageMs > 150) {
+        if (it->first < currentSeq - maxSeqAge || ageMs > maxTimeAgeMs) {
             if (!it->second.isCompleted) {
                 m_statsFramesDiscarded++;
                 Logger::W("UdpReceiver", "[FRAME_DROP] Discarding incomplete Frame #" + std::to_string(it->first) +

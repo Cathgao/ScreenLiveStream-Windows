@@ -23,6 +23,7 @@ public:
     bool Start(uint16_t listenPort = 8888);
     void Stop();
     bool IsRunning() const { return m_isRunning; }
+    void SetLowLatencyMode(bool enabled) { m_isLowLatencyMode.store(enabled); }
 
     void SetVideoCallback(VideoFrameCallback cb) { m_videoCallback = cb; }
     void SetAudioCallback(AudioFrameCallback cb) { m_audioCallback = cb; }
@@ -34,6 +35,7 @@ public:
 
 private:
     std::atomic<bool> m_isRunning{ false };
+    std::atomic<bool> m_isLowLatencyMode{ false };
     uint16_t m_listenPort = 8888;
     SOCKET m_sock = INVALID_SOCKET;
     std::thread m_recvThread;

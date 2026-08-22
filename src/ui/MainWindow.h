@@ -81,10 +81,6 @@ private:
     std::atomic<uint32_t> m_statsQueueEnqueued{ 0 };
     std::atomic<uint32_t> m_statsQueueDrops{ 0 };
     std::atomic<uint32_t> m_statsRenderedFrames{ 0 };
-    std::atomic<uint32_t> m_statsSkippedFramesAvSync{ 0 };
-    std::atomic<uint32_t> m_statsSkippedFramesVideoSync{ 0 };
-    std::atomic<uint32_t> m_statsSleepWaitCount{ 0 };
-    std::atomic<int64_t> m_statsTotalSleepWaitMs{ 0 };
     std::atomic<double> m_statsTotalQueueDelayMs{ 0.0 };
 
     void ReceiverDecodeLoop();
@@ -98,6 +94,7 @@ private:
     // State
     std::atomic<bool> m_isStreaming{ false };
     std::atomic<bool> m_isReceiving{ false };
+    std::atomic<bool> m_isLowLatencyMode{ false };
     bool m_isSenderMode = true;
 
     // Stats & Adaptation
@@ -129,6 +126,7 @@ private:
     HWND m_comboProtocol = nullptr;
     HWND m_chkCursor = nullptr;
     HWND m_chkAudio = nullptr;
+    HWND m_chkLowLatency = nullptr;
     HWND m_btnAction = nullptr;
 
     // UI Label Handles

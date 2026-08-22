@@ -19,14 +19,22 @@ public:
     bool Start(int sampleRate = 48000, int channels = 2);
     void Stop();
     bool IsPlaying() const { return m_isPlaying.load(std::memory_order_relaxed); }
+    void SetLowLatencyMode(bool enabled) { m_isLowLatencyMode.store(enabled); }
 
     void PushPcm(const uint8_t* pcmData, size_t bytes, int64_t timestampMs = -1);
 
     // Audio Master Clock: Returns the estimated PTS (in milliseconds) of audio currently emitted by speakers
     int64_t GetCurrentRenderedAudioPtsMs() const;
 
+    // Synchronize Audio with Video anchor PTS in large buffer mode
+    void AlignToAnchorPts(int64_t anchorPtsMs);
+
+    // Active AV-Sync drift correction based on current Video PTS
+    void SyncWithVideoPts(int64_t videoPtsMs);
+
 private:
     std::atomic<bool> m_isPlaying{ false };
+    std::atomic<bool> m_isLowLatencyMode{ false };
     std::thread m_playThread;
 
     int m_sampleRate = 48000;
@@ -42,7 +50,7 @@ private:
     std::deque<AudioSegment> m_ptsSegments;
     size_t m_queueReadOffset = 0;
     bool m_prebuffering = true;
-    size_t m_prebufferSamples = 1440; // ~15ms minimal hardware prebuffer (zero artificial pipeline delay)
+    size_t m_prebufferSamples = 0;
 
     std::atomic<int64_t> m_currentAudioPtsMs{ -1 };
     std::atomic<int64_t> m_lastAudioPtsLocalTimeMs{ 0 };
