@@ -237,7 +237,7 @@ std::vector<RateControlModeInfo> WmfVideoEncoder::QuerySupportedRateControlModes
 
     auto GetModeName = [](RateControlMode mode) -> std::wstring {
         switch (mode) {
-            case RateControlMode::UnconstrainedVBR: return L"VBR (动态码率 - 推荐)";
+            case RateControlMode::UnconstrainedVBR: return L"VBR (动态码率)";
             case RateControlMode::CBR: return L"CBR (恒定码率)";
             case RateControlMode::LowDelayVBR: return L"低延迟 VBR (Low-Delay)";
             case RateControlMode::PeakConstrainedVBR: return L"受限 VBR (Peak Constrained)";
