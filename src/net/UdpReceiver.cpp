@@ -267,16 +267,16 @@ void UdpReceiver::ProcessUdpvPacket(const uint8_t* buffer, int length, const soc
 void UdpReceiver::CheckAndAssembleUdpv(UdpvFrameBuffer& fb) {
     if (fb.isCompleted) return;
 
-    // XOR FEC Recovery using sender-negotiated group size
+    // Interleaved XOR FEC Recovery using sender-negotiated group size (i % m == groupId)
     int groupSize = fb.fecGroupSize > 0 ? fb.fecGroupSize : 10;
-    if (fb.receivedDataCount < fb.totalFragments && !fb.fecPackets.empty()) {
+    int m = (fb.totalFragments > 1) ? ((fb.totalFragments + groupSize - 1) / groupSize) : 0;
+    if (fb.receivedDataCount < fb.totalFragments && !fb.fecPackets.empty() && m > 0) {
         for (const auto& [groupId, fecPayload] : fb.fecPackets) {
-            int startIdx = groupId * groupSize;
-            int endIdx = (std::min)(startIdx + groupSize, static_cast<int>(fb.totalFragments));
+            if (groupId < 0 || groupId >= m) continue;
 
             int missingCount = 0;
             int missingIdx = -1;
-            for (int i = startIdx; i < endIdx; ++i) {
+            for (int i = groupId; i < static_cast<int>(fb.totalFragments); i += m) {
                 if (!fb.receivedFragments[i]) {
                     missingCount++;
                     missingIdx = i;
@@ -285,7 +285,7 @@ void UdpReceiver::CheckAndAssembleUdpv(UdpvFrameBuffer& fb) {
 
             if (missingCount == 1) {
                 std::vector<uint8_t> recovered(fecPayload);
-                for (int i = startIdx; i < endIdx; ++i) {
+                for (int i = groupId; i < static_cast<int>(fb.totalFragments); i += m) {
                     if (i != missingIdx && fb.receivedFragments[i]) {
                         size_t fragOffset = i * 1300;
                         size_t fragLen = fb.GetExpectedFragLength(i);
@@ -312,10 +312,10 @@ void UdpReceiver::CheckAndAssembleUdpv(UdpvFrameBuffer& fb) {
                     fb.fecRecoveredCount++;
                     m_statsFecRecovered++;
                     Logger::I("UdpReceiver", "[FEC] Recovered missing frag " + std::to_string(missingIdx) + "/" +
-                              std::to_string(fb.totalFragments) + " for Frame #" + std::to_string(fb.seq) + " (FEC Group " + std::to_string(groupId) + ")");
+                              std::to_string(fb.totalFragments) + " for Frame #" + std::to_string(fb.seq) + " (Interleaved Group " + std::to_string(groupId) + "/" + std::to_string(m) + ")");
                 }
             } else if (missingCount > 1) {
-                Logger::D("UdpReceiver", "[FEC] Group " + std::to_string(groupId) + " of Frame #" + std::to_string(fb.seq) +
+                Logger::D("UdpReceiver", "[FEC] Group " + std::to_string(groupId) + "/" + std::to_string(m) + " of Frame #" + std::to_string(fb.seq) +
                           " missing " + std::to_string(missingCount) + " frags (unrecoverable by single XOR)");
             }
         }
@@ -326,6 +326,13 @@ void UdpReceiver::CheckAndAssembleUdpv(UdpvFrameBuffer& fb) {
         bool isKeyframe = (fb.flags & 1) != 0;
         bool isCodecConfig = (fb.flags & 2) != 0;
         bool isHevc = (fb.flags & 4) != 0;
+
+        if (!isKeyframe && !isCodecConfig) {
+            if (m_lastAssembledSeq >= 0 && fb.seq > m_lastAssembledSeq + 1) {
+                Logger::W("UdpReceiver", "[GAP_DETECTED] Gap from " + std::to_string(m_lastAssembledSeq) + " to " + std::to_string(fb.seq) + ". Requesting IDR.");
+                RequestKeyframe();
+            }
+        }
 
         double assemblyMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fb.firstArrivalTime).count();
         m_statsFramesAssembled++;

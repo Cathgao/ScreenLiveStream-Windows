@@ -26,6 +26,13 @@ static inline void WriteBigEndian64(uint8_t* dst, uint64_t val) {
     dst[7] = static_cast<uint8_t>(val & 0xFF);
 }
 
+static inline void SpinPacingNanos(int64_t nanos) {
+    auto target = std::chrono::high_resolution_clock::now() + std::chrono::nanoseconds(nanos);
+    while (std::chrono::high_resolution_clock::now() < target) {
+        YieldProcessor();
+    }
+}
+
 UdpStreamer::UdpStreamer() {}
 
 UdpStreamer::~UdpStreamer() {
@@ -135,7 +142,7 @@ void UdpStreamer::SendFrame(
         return;
     }
 
-    // Video Frame: Fragment into 1300-byte chunks with XOR FEC (Zero Heap Allocations)
+    // Video Frame: Fragment into 1300-byte chunks with Interleaved XOR FEC
     const size_t CHUNK_SIZE = 1300;
     uint16_t totalFragments = static_cast<uint16_t>((size + CHUNK_SIZE - 1) / CHUNK_SIZE);
     if (totalFragments == 0) totalFragments = 1;
@@ -146,13 +153,18 @@ void UdpStreamer::SendFrame(
     if (isHevc) flags |= 0x04;
 
     const int FEC_GROUP_SIZE = 10;
-    uint8_t fecBuffer[1500] = {};
-    size_t fecSize = 0;
+    const int MAX_FEC_GROUPS = 64;
+    int numFecGroups = (totalFragments > 1) ? ((totalFragments + FEC_GROUP_SIZE - 1) / FEC_GROUP_SIZE) : 0;
+    if (numFecGroups > MAX_FEC_GROUPS) numFecGroups = MAX_FEC_GROUPS;
+
+    uint8_t fecBuffers[MAX_FEC_GROUPS][1500];
+    size_t fecSizes[MAX_FEC_GROUPS] = {};
+    bool fecInitialized[MAX_FEC_GROUPS] = {};
 
     static std::atomic<int> s_sentVideoFrames{ 0 };
     int sNum = ++s_sentVideoFrames;
     if (sNum == 1 || sNum % 180 == 0) {
-        Logger::I("UdpStreamer", "Streaming video frame #" + std::to_string(sNum) + " (" + std::to_string(size) + " bytes, " + std::to_string(totalFragments) + " frags, flags=0x" + std::to_string(flags) + ")");
+        Logger::I("UdpStreamer", "Streaming video frame #" + std::to_string(sNum) + " (" + std::to_string(size) + " bytes, " + std::to_string(totalFragments) + " frags, " + std::to_string(numFecGroups) + " FEC groups, flags=0x" + std::to_string(flags) + ")");
     }
 
     size_t offset = 0;
@@ -162,8 +174,35 @@ void UdpStreamer::SendFrame(
     packet[25] = static_cast<uint8_t>(FEC_GROUP_SIZE);
     packet[26] = packet[27] = 0;
 
+    bool isLargeFrame = totalFragments > 4;
+    int64_t paceNanos = isLargeFrame ? 30000 : 0;
+
     for (uint16_t i = 0; i < totalFragments; ++i) {
         size_t chunk = (size - offset > CHUNK_SIZE) ? CHUNK_SIZE : (size - offset);
+
+        // Interleaved FEC: Map fragment i -> group (i % numFecGroups)
+        if (numFecGroups > 0) {
+            int g = i % numFecGroups;
+            if (!fecInitialized[g]) {
+                std::memcpy(fecBuffers[g], data + offset, chunk);
+                fecSizes[g] = chunk;
+                fecInitialized[g] = true;
+            } else {
+                if (chunk > fecSizes[g]) {
+                    std::memset(fecBuffers[g] + fecSizes[g], 0, chunk - fecSizes[g]);
+                    fecSizes[g] = chunk;
+                }
+                size_t numLongs = chunk / sizeof(uint64_t);
+                uint64_t* dst64 = reinterpret_cast<uint64_t*>(fecBuffers[g]);
+                const uint64_t* src64 = reinterpret_cast<const uint64_t*>(data + offset);
+                for (size_t k = 0; k < numLongs; ++k) {
+                    dst64[k] ^= src64[k];
+                }
+                for (size_t k = numLongs * sizeof(uint64_t); k < chunk; ++k) {
+                    fecBuffers[g][k] ^= data[offset + k];
+                }
+            }
+        }
 
         WriteBigEndian32(&packet[4], currentSeq);
         WriteBigEndian64(&packet[8], static_cast<uint64_t>(timestampMs));
@@ -175,47 +214,36 @@ void UdpStreamer::SendFrame(
         int sent = sendto(m_sock, reinterpret_cast<const char*>(packet), static_cast<int>(28 + chunk), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
         if (sent > 0) m_sentBytes.fetch_add(sent);
 
-        // Compute XOR FEC parity for group (fast 64-bit uint64_t operations)
-        int groupIdx = i % FEC_GROUP_SIZE;
-        if (groupIdx == 0) {
-            std::memcpy(fecBuffer, data + offset, chunk);
-            fecSize = chunk;
-        } else {
-            if (chunk > fecSize) {
-                std::memset(fecBuffer + fecSize, 0, chunk - fecSize);
-                fecSize = chunk;
-            }
-            size_t numLongs = chunk / sizeof(uint64_t);
-            uint64_t* dst64 = reinterpret_cast<uint64_t*>(fecBuffer);
-            const uint64_t* src64 = reinterpret_cast<const uint64_t*>(data + offset);
-            for (size_t k = 0; k < numLongs; ++k) {
-                dst64[k] ^= src64[k];
-            }
-            for (size_t k = numLongs * sizeof(uint64_t); k < chunk; ++k) {
-                fecBuffer[k] ^= data[offset + k];
-            }
+        if (paceNanos > 0 && i < totalFragments - 1) {
+            SpinPacingNanos(paceNanos);
         }
 
-        bool isLastInGroup = (groupIdx == FEC_GROUP_SIZE - 1) || (i == totalFragments - 1);
-        if (isLastInGroup && totalFragments > 1 && fecSize > 0) {
-            int groupId = i / FEC_GROUP_SIZE;
+        offset += chunk;
+    }
+
+    // Send Interleaved FEC Parity Packets
+    if (numFecGroups > 0) {
+        for (int g = 0; g < numFecGroups; ++g) {
+            if (!fecInitialized[g]) continue;
             uint8_t fecPkt[1500];
             fecPkt[0] = 'U'; fecPkt[1] = 'D'; fecPkt[2] = 'P'; fecPkt[3] = 'V';
             WriteBigEndian32(&fecPkt[4], currentSeq);
             WriteBigEndian64(&fecPkt[8], static_cast<uint64_t>(timestampMs));
             fecPkt[16] = flags | 0x08; // FLAG_FEC
-            WriteBigEndian16(&fecPkt[17], static_cast<uint16_t>(groupId));
+            WriteBigEndian16(&fecPkt[17], static_cast<uint16_t>(g));
             WriteBigEndian16(&fecPkt[19], totalFragments);
             WriteBigEndian32(&fecPkt[21], static_cast<uint32_t>(size));
             fecPkt[25] = static_cast<uint8_t>(FEC_GROUP_SIZE);
             fecPkt[26] = fecPkt[27] = 0;
-            std::memcpy(&fecPkt[28], fecBuffer, fecSize);
+            std::memcpy(&fecPkt[28], fecBuffers[g], fecSizes[g]);
 
-            int fecSent = sendto(m_sock, reinterpret_cast<const char*>(fecPkt), static_cast<int>(28 + fecSize), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
+            int fecSent = sendto(m_sock, reinterpret_cast<const char*>(fecPkt), static_cast<int>(28 + fecSizes[g]), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
             if (fecSent > 0) m_sentBytes.fetch_add(fecSent);
-        }
 
-        offset += chunk;
+            if (paceNanos > 0 && g < numFecGroups - 1) {
+                SpinPacingNanos(paceNanos);
+            }
+        }
     }
 }
 
