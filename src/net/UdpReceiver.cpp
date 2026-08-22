@@ -41,6 +41,10 @@ void UdpReceiver::Stop() {
         if (m_recvThread.joinable()) {
             m_recvThread.join();
         }
+        m_udpvBuffers.clear();
+        m_nextExpectedSeq = -1;
+        m_sequencerCount = 0;
+        for (auto& s : m_sequencerSlots) s.Clear();
     }
 }
 
@@ -205,6 +209,9 @@ void UdpReceiver::ProcessUdpvPacket(const uint8_t* buffer, int length, const soc
         if (isRestart) {
             Logger::I("UdpReceiver", "Stream seq reset / restart detected (oldAssembled=" + std::to_string(m_lastAssembledSeq) + ", newSeq=" + std::to_string(seq) + ")");
             m_lastAssembledSeq = -1;
+            m_nextExpectedSeq = -1;
+            m_sequencerCount = 0;
+            for (auto& s : m_sequencerSlots) s.Clear();
             m_udpvBuffers.clear();
         } else {
             auto itCheck = m_udpvBuffers.find(seq);
@@ -217,7 +224,7 @@ void UdpReceiver::ProcessUdpvPacket(const uint8_t* buffer, int length, const soc
     auto it = m_udpvBuffers.find(seq);
     if (it == m_udpvBuffers.end()) {
         uint8_t fecGroupSize = buffer[25];
-        if (fecGroupSize == 0) fecGroupSize = 10;
+        if (fecGroupSize == 0) fecGroupSize = 8;
 
         UdpvFrameBuffer fb;
         fb.seq = seq;
@@ -267,8 +274,8 @@ void UdpReceiver::ProcessUdpvPacket(const uint8_t* buffer, int length, const soc
 void UdpReceiver::CheckAndAssembleUdpv(UdpvFrameBuffer& fb) {
     if (fb.isCompleted) return;
 
-    // Interleaved XOR FEC Recovery using sender-negotiated group size (i % m == groupId)
-    int groupSize = fb.fecGroupSize > 0 ? fb.fecGroupSize : 10;
+    // Interleaved XOR FEC Recovery: frag k mapped to k % m == groupId
+    int groupSize = fb.fecGroupSize > 0 ? fb.fecGroupSize : 8;
     int m = (fb.totalFragments > 1) ? ((fb.totalFragments + groupSize - 1) / groupSize) : 0;
     if (fb.receivedDataCount < fb.totalFragments && !fb.fecPackets.empty() && m > 0) {
         for (const auto& [groupId, fecPayload] : fb.fecPackets) {
@@ -311,48 +318,111 @@ void UdpReceiver::CheckAndAssembleUdpv(UdpvFrameBuffer& fb) {
                     fb.receivedDataCount++;
                     fb.fecRecoveredCount++;
                     m_statsFecRecovered++;
-                    Logger::I("UdpReceiver", "[FEC] Recovered missing frag " + std::to_string(missingIdx) + "/" +
-                              std::to_string(fb.totalFragments) + " for Frame #" + std::to_string(fb.seq) + " (Interleaved Group " + std::to_string(groupId) + "/" + std::to_string(m) + ")");
+                    Logger::I("UdpReceiver", "[FEC] Interleaved recovered missing frag " + std::to_string(missingIdx) + "/" +
+                              std::to_string(fb.totalFragments) + " for Frame #" + std::to_string(fb.seq) + " (Group " + std::to_string(groupId) + "/" + std::to_string(m) + ")");
                 }
-            } else if (missingCount > 1) {
-                Logger::D("UdpReceiver", "[FEC] Group " + std::to_string(groupId) + "/" + std::to_string(m) + " of Frame #" + std::to_string(fb.seq) +
-                          " missing " + std::to_string(missingCount) + " frags (unrecoverable by single XOR)");
             }
         }
     }
 
     if (fb.receivedDataCount == fb.totalFragments) {
-        fb.isCompleted = true;
-        bool isKeyframe = (fb.flags & 1) != 0;
-        bool isCodecConfig = (fb.flags & 2) != 0;
-        bool isHevc = (fb.flags & 4) != 0;
+        OnFrameCompleted(fb);
+    }
+}
 
-        if (!isKeyframe && !isCodecConfig) {
-            if (m_lastAssembledSeq >= 0 && fb.seq > m_lastAssembledSeq + 1) {
-                Logger::W("UdpReceiver", "[GAP_DETECTED] Gap from " + std::to_string(m_lastAssembledSeq) + " to " + std::to_string(fb.seq) + ". Requesting IDR.");
-                RequestKeyframe();
+void UdpReceiver::OnFrameCompleted(UdpvFrameBuffer& fb) {
+    fb.isCompleted = true;
+    bool isCodecConfig = (fb.flags & 2) != 0;
+    if (isCodecConfig) {
+        bool isKeyframe = (fb.flags & 1) != 0;
+        bool isHevc = (fb.flags & 4) != 0;
+        m_lastAssembledSeq = fb.seq;
+        if (m_videoCallback) {
+            m_videoCallback(fb.frameBytes.data(), fb.frameSize, fb.timestampMs, isKeyframe, isCodecConfig, isHevc);
+        }
+        return;
+    }
+
+    if (m_sequencerSlots.size() < SEQUENCER_SIZE) {
+        m_sequencerSlots.resize(SEQUENCER_SIZE);
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    size_t slotIdx = static_cast<size_t>(fb.seq) & (SEQUENCER_SIZE - 1);
+    auto& slot = m_sequencerSlots[slotIdx];
+    if (!slot.isOccupied) {
+        m_sequencerCount++;
+    }
+    slot.CopyFrom(fb, now);
+
+    if (m_nextExpectedSeq == -1 || std::abs(fb.seq - m_nextExpectedSeq) > 100) {
+        m_nextExpectedSeq = fb.seq;
+    }
+
+    FlushSequencer(now);
+}
+
+void UdpReceiver::FlushSequencer(const std::chrono::steady_clock::time_point& now) {
+    if (m_sequencerCount == 0 || m_nextExpectedSeq == -1) return;
+
+    // 1. Dispatch contiguous ascending sequence without wait
+    while (true) {
+        size_t slotIdx = static_cast<size_t>(m_nextExpectedSeq) & (SEQUENCER_SIZE - 1);
+        auto& slot = m_sequencerSlots[slotIdx];
+        if (slot.isOccupied && slot.seq == m_nextExpectedSeq) {
+            DispatchSlot(slot);
+            slot.Clear();
+            m_sequencerCount--;
+            m_nextExpectedSeq++;
+        } else {
+            break;
+        }
+    }
+
+    if (m_sequencerCount == 0) return;
+
+    // 2. Timeout check on oldest waiting frame to avoid stall on truly dropped frames
+    bool isLowLatency = m_isLowLatencyMode.load(std::memory_order_relaxed);
+    int maxWaitMs = isLowLatency ? 12 : 40;
+
+    for (size_t i = 0; i < SEQUENCER_SIZE; ++i) {
+        auto& slot = m_sequencerSlots[i];
+        if (slot.isOccupied) {
+            auto waitTime = std::chrono::duration_cast<std::chrono::milliseconds>(now - slot.readyTime).count();
+            if (waitTime > maxWaitMs || (slot.seq - m_nextExpectedSeq > 20)) {
+                m_nextExpectedSeq = slot.seq;
+                while (true) {
+                    size_t curIdx = static_cast<size_t>(m_nextExpectedSeq) & (SEQUENCER_SIZE - 1);
+                    auto& curSlot = m_sequencerSlots[curIdx];
+                    if (curSlot.isOccupied && curSlot.seq == m_nextExpectedSeq) {
+                        DispatchSlot(curSlot);
+                        curSlot.Clear();
+                        m_sequencerCount--;
+                        m_nextExpectedSeq++;
+                    } else {
+                        break;
+                    }
+                }
+                break;
             }
         }
+    }
+}
 
-        double assemblyMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fb.firstArrivalTime).count();
-        m_statsFramesAssembled++;
-        m_statsTotalAssemblyMs += assemblyMs;
-        if (isKeyframe) m_statsKeyframes++;
-
-        if (assemblyMs > 25.0) {
-            Logger::W("UdpReceiver", "[SLOW_ASSEMBLY] Frame #" + std::to_string(fb.seq) + " (" +
-                      std::to_string(fb.frameSize) + " bytes, " + std::to_string(fb.totalFragments) +
-                      " frags, FEC recovered: " + std::to_string(fb.fecRecoveredCount) + ") took " +
-                      std::to_string(assemblyMs) + " ms to assemble");
+void UdpReceiver::DispatchSlot(SequencerSlot& slot) {
+    if (!slot.isCodecConfig) {
+        if (m_lastAssembledSeq >= 0 && slot.seq > m_lastAssembledSeq + 1) {
+            Logger::W("UdpReceiver", "[GAP_DETECTED] Gap from " + std::to_string(m_lastAssembledSeq) + " to " + std::to_string(slot.seq) + ". Requesting IDR.");
+            RequestKeyframe();
         }
+    }
 
-        if (fb.seq > m_lastAssembledSeq) {
-            m_lastAssembledSeq = fb.seq;
-        }
+    m_statsFramesAssembled++;
+    if (slot.isKeyframe) m_statsKeyframes++;
+    m_lastAssembledSeq = slot.seq;
 
-        if (m_videoCallback) {
-            m_videoCallback(fb.frameBytes.data(), fb.frameBytes.size(), fb.timestampMs, isKeyframe, isCodecConfig, isHevc);
-        }
+    if (m_videoCallback) {
+        m_videoCallback(slot.frameBytes.data(), slot.frameSize, slot.timestampMs, slot.isKeyframe, slot.isCodecConfig, slot.isHevc);
     }
 }
 
@@ -379,6 +449,7 @@ void UdpReceiver::CleanOldUdpvFrames(int32_t currentSeq) {
             ++it;
         }
     }
+    FlushSequencer(now);
 }
 
 void UdpReceiver::RequestKeyframe() {

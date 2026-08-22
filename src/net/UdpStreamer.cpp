@@ -152,7 +152,7 @@ void UdpStreamer::SendFrame(
     if (isCodecConfig && !isKeyframe) flags |= 0x02;
     if (isHevc) flags |= 0x04;
 
-    const int FEC_GROUP_SIZE = 10;
+    const int FEC_GROUP_SIZE = 8;
     const int MAX_FEC_GROUPS = 64;
     int numFecGroups = (totalFragments > 1) ? ((totalFragments + FEC_GROUP_SIZE - 1) / FEC_GROUP_SIZE) : 0;
     if (numFecGroups > MAX_FEC_GROUPS) numFecGroups = MAX_FEC_GROUPS;
@@ -167,7 +167,6 @@ void UdpStreamer::SendFrame(
         Logger::I("UdpStreamer", "Streaming video frame #" + std::to_string(sNum) + " (" + std::to_string(size) + " bytes, " + std::to_string(totalFragments) + " frags, " + std::to_string(numFecGroups) + " FEC groups, flags=0x" + std::to_string(flags) + ")");
     }
 
-    size_t offset = 0;
     uint8_t packet[1500];
     packet[0] = 'U'; packet[1] = 'D'; packet[2] = 'P'; packet[3] = 'V';
     packet[16] = flags;
@@ -177,10 +176,10 @@ void UdpStreamer::SendFrame(
     bool isLargeFrame = totalFragments > 4;
     int64_t paceNanos = isLargeFrame ? 30000 : 0;
 
+    size_t offset = 0;
     for (uint16_t i = 0; i < totalFragments; ++i) {
         size_t chunk = (size - offset > CHUNK_SIZE) ? CHUNK_SIZE : (size - offset);
 
-        // Interleaved FEC: Map fragment i -> group (i % numFecGroups)
         if (numFecGroups > 0) {
             int g = i % numFecGroups;
             if (!fecInitialized[g]) {

@@ -53,7 +53,7 @@ private:
         uint32_t frameSize = 0;
         int64_t timestampMs = 0;
         uint8_t flags = 0;
-        uint8_t fecGroupSize = 10;
+        uint8_t fecGroupSize = 8;
         std::vector<uint8_t> frameBytes;
         std::vector<bool> receivedFragments;
         int receivedDataCount = 0;
@@ -68,6 +68,43 @@ private:
             return frameSize - (totalFragments - 1) * 1300;
         }
     };
+
+    struct SequencerSlot {
+        bool isOccupied = false;
+        int32_t seq = -1;
+        size_t frameSize = 0;
+        int64_t timestampMs = 0;
+        bool isKeyframe = false;
+        bool isCodecConfig = false;
+        bool isHevc = false;
+        std::chrono::steady_clock::time_point readyTime;
+        std::vector<uint8_t> frameBytes;
+
+        void CopyFrom(const UdpvFrameBuffer& fb, const std::chrono::steady_clock::time_point& now) {
+            isOccupied = true;
+            seq = fb.seq;
+            frameSize = fb.frameSize;
+            timestampMs = fb.timestampMs;
+            isKeyframe = (fb.flags & 1) != 0;
+            isCodecConfig = (fb.flags & 2) != 0;
+            isHevc = (fb.flags & 4) != 0;
+            readyTime = now;
+            if (frameBytes.size() < fb.frameSize) {
+                frameBytes.resize((std::max)(static_cast<size_t>(fb.frameSize), static_cast<size_t>(256 * 1024)));
+            }
+            std::memcpy(frameBytes.data(), fb.frameBytes.data(), fb.frameSize);
+        }
+
+        void Clear() {
+            isOccupied = false;
+            seq = -1;
+        }
+    };
+
+    static constexpr size_t SEQUENCER_SIZE = 64;
+    std::vector<SequencerSlot> m_sequencerSlots;
+    int32_t m_nextExpectedSeq = -1;
+    int m_sequencerCount = 0;
 
     std::unordered_map<int32_t, UdpvFrameBuffer> m_udpvBuffers;
     int32_t m_lastAssembledSeq = -1;
@@ -91,6 +128,9 @@ private:
     void RecvThreadProc();
     void ProcessUdpvPacket(const uint8_t* buffer, int length, const sockaddr_in& senderAddr);
     void CheckAndAssembleUdpv(UdpvFrameBuffer& fb);
+    void OnFrameCompleted(UdpvFrameBuffer& fb);
+    void FlushSequencer(const std::chrono::steady_clock::time_point& now);
+    void DispatchSlot(SequencerSlot& slot);
     void CleanOldUdpvFrames(int32_t currentSeq);
     void RequestKeyframe();
     void LogPeriodicStats();
