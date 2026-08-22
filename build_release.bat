@@ -34,12 +34,14 @@ cmake --build build --config Release
 if errorlevel 1 (
     echo.
     echo [ERROR] Build failed!
+@pause
     exit /b 1
 )
-
+cls
 echo.
 echo ========================================================
 echo [SUCCESS] Build completed successfully!
 echo Binary: build\ScreenLiveStreamWindows.exe
 echo ========================================================
 endlocal
+@timeout /NOBREAK 3

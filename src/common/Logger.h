@@ -8,6 +8,11 @@
 #include <iomanip>
 #include <windows.h>
 
+// Set to 1 to enable writing logs to ScreenLiveStream.log file, or 0 to disable
+#ifndef ENABLE_FILE_LOGGING
+#define ENABLE_FILE_LOGGING 0
+#endif
+
 enum class LogLevel {
     Debug,
     Info,
@@ -43,11 +48,13 @@ public:
         OutputDebugStringA(str.c_str());
         std::cout << str;
 
+#if ENABLE_FILE_LOGGING
         std::ofstream& file = GetLogFile();
         if (file.is_open()) {
             file << str;
             file.flush();
         }
+#endif
     }
 
     static void D(const std::string& tag, const std::string& msg) { Log(LogLevel::Debug, tag, msg); }
@@ -61,8 +68,10 @@ private:
         return s_mutex;
     }
 
+#if ENABLE_FILE_LOGGING
     static std::ofstream& GetLogFile() {
         static std::ofstream s_logFile("ScreenLiveStream.log", std::ios::out | std::ios::app);
         return s_logFile;
     }
+#endif
 };
