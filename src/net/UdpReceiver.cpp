@@ -290,7 +290,14 @@ void UdpReceiver::CheckAndAssembleUdpv(UdpvFrameBuffer& fb) {
                     if (i != missingIdx && fb.receivedFragments[i]) {
                         size_t fragOffset = i * 1300;
                         size_t fragLen = fb.GetExpectedFragLength(i);
-                        for (size_t k = 0; k < fragLen && k < recovered.size(); ++k) {
+                        size_t limitLen = (std::min)(fragLen, recovered.size());
+                        size_t numLongs = limitLen / sizeof(uint64_t);
+                        uint64_t* dst64 = reinterpret_cast<uint64_t*>(recovered.data());
+                        const uint64_t* src64 = reinterpret_cast<const uint64_t*>(fb.frameBytes.data() + fragOffset);
+                        for (size_t k = 0; k < numLongs; ++k) {
+                            dst64[k] ^= src64[k];
+                        }
+                        for (size_t k = numLongs * sizeof(uint64_t); k < limitLen; ++k) {
                             recovered[k] ^= fb.frameBytes[fragOffset + k];
                         }
                     }

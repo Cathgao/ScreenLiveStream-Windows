@@ -145,7 +145,7 @@ void UdpStreamer::SendFrame(
     if (isCodecConfig && !isKeyframe) flags |= 0x02;
     if (isHevc) flags |= 0x04;
 
-    const int FEC_GROUP_SIZE = 12;
+    const int FEC_GROUP_SIZE = 10;
     uint8_t fecBuffer[1500] = {};
     size_t fecSize = 0;
 
@@ -159,7 +159,8 @@ void UdpStreamer::SendFrame(
     uint8_t packet[1500];
     packet[0] = 'U'; packet[1] = 'D'; packet[2] = 'P'; packet[3] = 'V';
     packet[16] = flags;
-    packet[25] = packet[26] = packet[27] = 0;
+    packet[25] = static_cast<uint8_t>(FEC_GROUP_SIZE);
+    packet[26] = packet[27] = 0;
 
     for (uint16_t i = 0; i < totalFragments; ++i) {
         size_t chunk = (size - offset > CHUNK_SIZE) ? CHUNK_SIZE : (size - offset);
@@ -174,7 +175,7 @@ void UdpStreamer::SendFrame(
         int sent = sendto(m_sock, reinterpret_cast<const char*>(packet), static_cast<int>(28 + chunk), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
         if (sent > 0) m_sentBytes.fetch_add(sent);
 
-        // Compute XOR FEC parity for group (in-place stack buffer)
+        // Compute XOR FEC parity for group (fast 64-bit uint64_t operations)
         int groupIdx = i % FEC_GROUP_SIZE;
         if (groupIdx == 0) {
             std::memcpy(fecBuffer, data + offset, chunk);
@@ -184,7 +185,13 @@ void UdpStreamer::SendFrame(
                 std::memset(fecBuffer + fecSize, 0, chunk - fecSize);
                 fecSize = chunk;
             }
-            for (size_t k = 0; k < chunk; ++k) {
+            size_t numLongs = chunk / sizeof(uint64_t);
+            uint64_t* dst64 = reinterpret_cast<uint64_t*>(fecBuffer);
+            const uint64_t* src64 = reinterpret_cast<const uint64_t*>(data + offset);
+            for (size_t k = 0; k < numLongs; ++k) {
+                dst64[k] ^= src64[k];
+            }
+            for (size_t k = numLongs * sizeof(uint64_t); k < chunk; ++k) {
                 fecBuffer[k] ^= data[offset + k];
             }
         }
@@ -200,7 +207,8 @@ void UdpStreamer::SendFrame(
             WriteBigEndian16(&fecPkt[17], static_cast<uint16_t>(groupId));
             WriteBigEndian16(&fecPkt[19], totalFragments);
             WriteBigEndian32(&fecPkt[21], static_cast<uint32_t>(size));
-            fecPkt[25] = fecPkt[26] = fecPkt[27] = 0;
+            fecPkt[25] = static_cast<uint8_t>(FEC_GROUP_SIZE);
+            fecPkt[26] = fecPkt[27] = 0;
             std::memcpy(&fecPkt[28], fecBuffer, fecSize);
 
             int fecSent = sendto(m_sock, reinterpret_cast<const char*>(fecPkt), static_cast<int>(28 + fecSize), 0, (sockaddr*)&m_targetAddr, sizeof(m_targetAddr));
